@@ -1034,8 +1034,14 @@ class GitClient:
 
         Used when updating an existing export PR branch — the branch exists
         on the remote but may not exist locally yet.
+        Raises RuntimeError if the branch no longer exists on the remote
+        (e.g. deleted after the PR was merged/closed).
         """
-        self._run(["fetch", "origin", branch], check=False)
+        fetch = self._run(["fetch", "origin", branch], check=False)
+        if fetch.returncode != 0:
+            raise RuntimeError(
+                f"Branch '{branch}' not found on remote — it was likely deleted"
+            )
         result = self._run(["checkout", branch], check=False)
         if result.returncode != 0:
             # Local branch doesn't exist yet — create it tracking the remote
@@ -1140,6 +1146,34 @@ class GitClient:
 
         return {"url": "", "number": 0, "status": "not_supported",
                 "error": f"Provider {self.provider} not supported for PR creation"}
+
+    def close_pr(self, pr_number: int, comment: str = None):
+        """Close an open PR (and optionally leave a comment) via GitHub API."""
+        import requests
+
+        if self.provider != "github":
+            return
+
+        match = re.search(r"github\.com[/:]([^/]+)/([^/.]+)", self.repo_url)
+        if not match:
+            return
+        owner, repo = match.group(1), match.group(2)
+        headers = {"Authorization": f"token {self.token}", "Accept": "application/json"}
+
+        if comment:
+            requests.post(
+                f"https://api.github.com/repos/{owner}/{repo}/issues/{pr_number}/comments",
+                headers=headers,
+                json={"body": comment},
+                timeout=30,
+            )
+        requests.patch(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}",
+            headers=headers,
+            json={"state": "closed"},
+            timeout=30,
+        )
+        log.info("Closed stale export PR #%d", pr_number)
 
     def delete_merged_export_branches(self, branch_prefix: str = "policy-gitops/export-",
                                        keep_branch: str = None):
@@ -1554,8 +1588,28 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
                     "Existing export PR #%d open (%s) — pushing new commits onto %s",
                     existing_pr["number"], existing_pr["url"], export_branch,
                 )
-                git_client.fetch_and_checkout(export_branch)
-            else:
+                try:
+                    git_client.fetch_and_checkout(export_branch)
+                except RuntimeError as exc:
+                    # Branch was deleted from remote (e.g. by GitHub's "delete branch"
+                    # button after a merge, or by our cleanup workflow). Close the
+                    # broken PR and start fresh so this export cycle isn't lost.
+                    log.warning(
+                        "Stale export PR #%d — branch missing on remote (%s). "
+                        "Closing PR and creating fresh branch.",
+                        existing_pr["number"], exc,
+                    )
+                    git_client.close_pr(
+                        existing_pr["number"],
+                        comment=(
+                            "Closing automatically: the export branch was deleted from the remote "
+                            "and can no longer be updated. A fresh export PR will be created."
+                        ),
+                    )
+                    existing_pr = None
+                    export_branch = None
+
+            if not existing_pr:
                 export_branch = (
                     f"policy-gitops/export-"
                     f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
