@@ -1,4 +1,4 @@
-name: Provision Policy
+name: Provision Policy to PCE
 
 on:
   push:
@@ -13,21 +13,12 @@ permissions:
 
 jobs:
   provision:
-    name: Provision to PCE
+    name: Provision to PCE Draft
     runs-on: ubuntu-latest
-    environment: production  # Configure environment protection rules in GitHub
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2  # Need previous commit for diff
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: pip install illumio pyyaml
+          fetch-depth: 2
 
       - name: Detect changed files
         id: changes
@@ -36,16 +27,46 @@ jobs:
           echo "files<<EOF" >> $GITHUB_OUTPUT
           echo "$CHANGED" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
+          COUNT=$(echo "$CHANGED" | grep -c '.' || true)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
 
-      - name: Provision to PCE
+      - name: Check for bot export commit
+        id: bot
+        run: |
+          # Export commits (plugin syncing PCE -> Git) start with "policy-gitops:"
+          # or are authored by the policy-gitops bot. Skip provisioning for these —
+          # the content already came FROM the PCE and must not be sent back.
+          MSG=$(git log --no-merges -1 --format='%s' 2>/dev/null || git log -1 --format='%s')
+          AUTHOR=$(git log --no-merges -1 --format='%an' 2>/dev/null || git log -1 --format='%an')
+          if [[ "$MSG" == policy-gitops:* ]] || [[ "$AUTHOR" == "policy-gitops" ]]; then
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "Skipping provision: bot export commit detected (author=$AUTHOR)"
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "Human commit detected — will provision (author=$AUTHOR)"
+          fi
+
+      - name: Setup Python
+        if: steps.changes.outputs.count != '0' && steps.bot.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: steps.changes.outputs.count != '0' && steps.bot.outputs.skip != 'true'
+        run: pip install illumio pyyaml
+
+      - name: Provision to PCE draft
+        if: steps.changes.outputs.count != '0' && steps.bot.outputs.skip != 'true'
         env:
           PCE_HOST: ${{ secrets.PCE_HOST }}
           PCE_PORT: ${{ secrets.PCE_PORT }}
           PCE_ORG_ID: ${{ secrets.PCE_ORG_ID }}
           PCE_API_KEY: ${{ secrets.PCE_API_KEY }}
           PCE_API_SECRET: ${{ secrets.PCE_API_SECRET }}
-        run: |
-          python3 .github/scripts/provision.py \
-            --changed-files "${{ steps.changes.outputs.files }}" \
-            --mode draft
-          # Change to --mode active for auto-provision
+          CHANGED_FILES: ${{ steps.changes.outputs.files }}
+        run: python3 .github/scripts/provision.py
+
+      - name: Summary
+        if: always()
+        run: echo "Provision complete — check PCE draft policy"

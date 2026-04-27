@@ -29,6 +29,9 @@ env:
   - name: DRIFT_ALERT
     required: false
     default: "true"
+  - name: EXPORT_AS_PR
+    required: false
+    default: "false"
   - name: PCE_TLS_SKIP_VERIFY
     required: false
     default: "true"

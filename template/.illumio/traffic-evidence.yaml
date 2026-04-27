@@ -1,0 +1,40 @@
+# Traffic evidence configuration for policy PR validation
+#
+# When a PR adds or changes rules, the pipeline queries the PCE for blocked
+# traffic matching those rules. This provides evidence that a new rule is
+# justified by real traffic rather than being speculative.
+#
+# This file is optional — omit it to use the defaults shown below.
+
+enabled: true
+
+# How far back to query for blocked traffic (in days)
+lookback_days: 30
+
+# Minimum blocked connections required to count a rule as "justified"
+min_connections: 10
+
+# Verdict thresholds (blocked connection counts)
+thresholds:
+  justified: 10      # >= 10 connections → JUSTIFIED
+  weak_evidence: 1   # 1-9 connections  → WEAK EVIDENCE
+  # < weak_evidence  → NO EVIDENCE
+
+# Traffic query settings
+query:
+  policy_decisions:
+    - blocked
+    - potentially_blocked
+  # Ports to skip (common infra noise — unlikely to be the rule's intent)
+  exclude_ports: []
+  # exclude_ports: [22, 53, 123]
+
+# Per-scope overrides (matched against ruleset scope labels as "key=value")
+# Unmatched scopes use the global settings above.
+scope_overrides: {}
+# scope_overrides:
+#   "env=prod":
+#     lookback_days: 90     # longer lookback for production
+#     min_connections: 50
+#   "env=dev":
+#     enabled: false        # skip traffic evidence for dev environments
