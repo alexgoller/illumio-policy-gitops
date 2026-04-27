@@ -82,6 +82,60 @@ def get_scope_config(config: dict, scope_labels: dict) -> dict:
     return merged
 
 
+def load_service_port_map(repo_root: str = ".") -> dict:
+    """Build name→[ports] lookup from services/*.yaml files in the repo.
+
+    Service objects in rules are stored as {name: mysql} — the actual port
+    definitions live in services/mysql.yaml as service_ports: [{port:3306}].
+    Returns {} if the services directory doesn't exist (graceful degradation).
+    """
+    svc_dir = os.path.join(repo_root, "services")
+    port_map = {}
+    if not os.path.isdir(svc_dir):
+        return port_map
+    for fname in os.listdir(svc_dir):
+        if not fname.endswith((".yaml", ".yml")):
+            continue
+        try:
+            with open(os.path.join(svc_dir, fname)) as f:
+                data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                continue
+            name = data.get("name", "")
+            ports = [
+                sp["port"]
+                for sp in data.get("service_ports", [])
+                if isinstance(sp, dict) and "port" in sp
+            ]
+            if name and ports:
+                port_map[name] = ports
+        except Exception:
+            pass
+    return port_map
+
+
+def _resolve_ports(services: list, service_port_map: dict, exclude_ports: set) -> list:
+    """Extract port numbers from a rule's service list.
+
+    Handles both inline ports ({port: 3306}) and named service references
+    ({name: mysql}) by looking up the name in service_port_map.
+    Returns an empty list when services is empty (means All Services).
+    """
+    ports = []
+    for svc in services:
+        if not isinstance(svc, dict):
+            continue
+        if "port" in svc:
+            p = svc["port"]
+            if p not in exclude_ports:
+                ports.append(p)
+        elif "name" in svc:
+            for p in service_port_map.get(svc["name"], []):
+                if p not in exclude_ports:
+                    ports.append(p)
+    return ports
+
+
 def get_pce():
     """Create PCE client from environment."""
     if not HAS_ILLUMIO:
@@ -122,11 +176,14 @@ def extract_rules_from_file(filepath):
                 if isinstance(lbl, dict):
                     scope_labels.update(lbl)
 
+    ruleset_name = data.get("name") or os.path.splitext(os.path.basename(filepath))[0]
+
     rules = []
     for rule in data.get("rules", []):
         if isinstance(rule, dict):
             rules.append({
                 "file": filepath,
+                "ruleset_name": ruleset_name,
                 "name": rule.get("name", "(unnamed)"),
                 "consumers": rule.get("consumers", []),
                 "providers": rule.get("providers", []),
@@ -141,6 +198,7 @@ def extract_rules_from_file(filepath):
         services = data.get("services", [])
         rules.append({
             "file": filepath,
+            "ruleset_name": ruleset_name,
             "name": data.get("name", "(unnamed)"),
             "consumers": consumers,
             "providers": providers,
@@ -162,7 +220,8 @@ def _make_verdict(total_connections: int, thresholds: dict, lookback_days: int,
     return f"NO EVIDENCE — 0 blocked connections in {lookback_days} days"
 
 
-def query_traffic_for_rule(pce, rule: dict, scope_cfg: dict, global_config: dict) -> dict:
+def query_traffic_for_rule(pce, rule: dict, scope_cfg: dict, global_config: dict,
+                           service_port_map: dict = None) -> dict:
     """Query PCE for blocked traffic matching a rule's pattern."""
     if not pce:
         return None
@@ -175,16 +234,18 @@ def query_traffic_for_rule(pce, rule: dict, scope_cfg: dict, global_config: dict
     )
     thresholds = global_config.get("thresholds", {})
 
-    # Extract ports
-    ports = []
-    for svc in rule.get("services", []):
-        if isinstance(svc, dict):
-            port = svc.get("port")
-            if port and port not in exclude_ports:
-                ports.append(port)
+    services = rule.get("services", [])
 
-    if not ports:
-        return {"traffic_found": False, "reason": "No specific ports in rule"}
+    # Empty services list = "All Services" in Illumio — query all flows, no port filter.
+    all_services = not services
+    ports = [] if all_services else _resolve_ports(services, service_port_map or {}, exclude_ports)
+
+    if not all_services and not ports:
+        named = [s["name"] for s in services if isinstance(s, dict) and "name" in s]
+        if named:
+            return {"traffic_found": False,
+                    "reason": f"Service ports not resolved: {', '.join(named)}"}
+        return {"traffic_found": False, "reason": "No queryable ports in rule (ICMP/Windows services)"}
 
     try:
         end = datetime.now(timezone.utc)
@@ -209,8 +270,11 @@ def query_traffic_for_rule(pce, rule: dict, scope_cfg: dict, global_config: dict
 
             service = flow.get("service", {})
             flow_port = service.get("port") if isinstance(service, dict) else None
+            flow_proto = service.get("proto", "?") if isinstance(service, dict) else "?"
 
-            if flow_port not in ports:
+            # Port filter: skip flows not matching our port list.
+            # All-Services rules have no port list — include every flow.
+            if not all_services and flow_port not in ports:
                 continue
 
             src = flow.get("src", {})
@@ -221,20 +285,22 @@ def query_traffic_for_rule(pce, rule: dict, scope_cfg: dict, global_config: dict
             src_name = src.get("workload", {}).get("hostname", src.get("ip", "?"))
             dst_name = dst.get("workload", {}).get("hostname", dst.get("ip", "?"))
 
+            port_label = f"{flow_port}/{flow_proto}" if flow_port else f"?/{flow_proto}"
             matching_flows.append({
                 "src": src_name,
                 "dst": dst_name,
-                "port": f"{flow_port}/{service.get('proto', '?')}",
+                "port": port_label,
                 "connections": num,
                 "decision": flow.get("policy_decision", "unknown"),
             })
 
         if total_connections < min_connections:
+            scope_desc = "any port" if all_services else f"ports {ports}"
             return {
                 "traffic_found": False,
                 "blocked_connections": total_connections,
                 "reason": (
-                    f"No blocked traffic found on ports {ports} in last {lookback_days} days"
+                    f"No blocked traffic found ({scope_desc}) in last {lookback_days} days"
                     if total_connections == 0
                     else f"Only {total_connections} connection(s) — below min_connections threshold ({min_connections})"
                 ),
@@ -278,6 +344,12 @@ def main():
     if not pce:
         print("PCE not configured — skipping traffic evidence")
 
+    # Build service name→ports map once from the repo's services/ directory.
+    # Rules reference services by name ({name: mysql}); ports live in services/mysql.yaml.
+    service_port_map = load_service_port_map()
+    if service_port_map:
+        print(f"Loaded port definitions for {len(service_port_map)} service objects")
+
     files = [f.strip() for f in args.changed_files.split("\n") if f.strip() and f.endswith((".yaml", ".yml"))]
 
     evidence = []
@@ -291,11 +363,16 @@ def main():
             continue
 
         for rule in rules:
-            result = query_traffic_for_rule(pce, rule, scope_cfg, config)
+            result = query_traffic_for_rule(pce, rule, scope_cfg, config, service_port_map)
+            # Collect resolved ports (inline + named service lookups) for the report
+            resolved_ports = _resolve_ports(
+                rule.get("services", []), service_port_map, set()
+            )
             evidence.append({
                 "file": rule["file"],
+                "ruleset_name": rule["ruleset_name"],
                 "rule_name": rule["name"],
-                "ports": [s.get("port") for s in rule.get("services", []) if isinstance(s, dict) and s.get("port")],
+                "ports": resolved_ports,
                 **(result or {"traffic_found": False, "reason": "PCE not configured"}),
             })
 
