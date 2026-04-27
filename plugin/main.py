@@ -47,6 +47,7 @@ SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "3600"))
 AUTO_PROVISION = os.environ.get("AUTO_PROVISION", "false").lower() in ("true", "1", "yes")
 DRIFT_ALERT = os.environ.get("DRIFT_ALERT", "true").lower() in ("true", "1", "yes")
 EXPORT_AS_PR = os.environ.get("EXPORT_AS_PR", "false").lower() in ("true", "1", "yes")
+EXPORT_POLICY_SCOPE = os.environ.get("EXPORT_POLICY_SCOPE", "active")  # active or draft
 
 # Protocol number to name mapping (IANA)
 PROTO_NUM_TO_NAME = {6: "tcp", 17: "udp", 1: "icmp", 58: "icmpv6"}
@@ -179,7 +180,7 @@ class PolicySerializer:
     def refresh_service_cache(self):
         """Fetch all services from PCE and cache href -> service mapping."""
         try:
-            resp = self.pce.get("/sec_policy/active/services")
+            resp = self.pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
             if resp.status_code == 200:
                 for svc in resp.json():
                     href = svc.get("href", "")
@@ -192,7 +193,7 @@ class PolicySerializer:
     def refresh_ip_list_cache(self):
         """Fetch all IP lists from PCE and cache href -> ip_list mapping."""
         try:
-            resp = self.pce.get("/sec_policy/active/ip_lists")
+            resp = self.pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
             if resp.status_code == 200:
                 for ipl in resp.json():
                     href = ipl.get("href", "")
@@ -1225,7 +1226,7 @@ class DriftDetector:
         # Fetch rulesets from PCE
         pce_rulesets = {}  # name -> serialized yaml_data
         try:
-            resp = pce.get("/sec_policy/active/rule_sets", params={"max_results": 5000})
+            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/rule_sets", params={"max_results": 5000})
             if resp.status_code == 200:
                 for rs in resp.json():
                     name = rs.get("name", "")
@@ -1283,7 +1284,7 @@ class DriftDetector:
         # Fetch PCE IP lists
         pce_ip_lists = {}
         try:
-            resp = pce.get("/sec_policy/active/ip_lists")
+            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
             if resp.status_code == 200:
                 for ipl in resp.json():
                     name = ipl.get("name", "")
@@ -1338,7 +1339,7 @@ class DriftDetector:
         # Fetch PCE services
         pce_services = {}
         try:
-            resp = pce.get("/sec_policy/active/services")
+            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
             if resp.status_code == 200:
                 for svc in resp.json():
                     name = svc.get("name", "")
@@ -1492,7 +1493,7 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
 
         # --- Export rulesets ---
         try:
-            resp = pce.get("/sec_policy/active/rule_sets", params={"max_results": 5000})
+            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/rule_sets", params={"max_results": 5000})
             if resp.status_code == 200:
                 rulesets = resp.json()
                 pce_ruleset_names = {rs.get("name") for rs in rulesets}
@@ -1544,7 +1545,7 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
 
         # --- Export IP lists ---
         try:
-            resp = pce.get("/sec_policy/active/ip_lists")
+            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
             if resp.status_code == 200:
                 ip_lists = resp.json()
                 pce_iplist_names = {ipl.get("name") for ipl in ip_lists}
@@ -1572,7 +1573,7 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
 
         # --- Export services ---
         try:
-            resp = pce.get("/sec_policy/active/services")
+            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
             if resp.status_code == 200:
                 services = resp.json()
                 pce_service_names = {svc.get("name") for svc in services}
@@ -1778,7 +1779,7 @@ def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
         # Fall back to active if draft is empty
         if not pce_rulesets:
             try:
-                resp = pce.get("/sec_policy/active/rule_sets", params={"max_results": 5000})
+                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/rule_sets", params={"max_results": 5000})
                 if resp.status_code == 200:
                     for rs in resp.json():
                         pce_rulesets[rs.get("name", "")] = rs.get("href", "")
@@ -1794,7 +1795,7 @@ def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
             pass
         if not pce_ip_lists:
             try:
-                resp = pce.get("/sec_policy/active/ip_lists")
+                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
                 if resp.status_code == 200:
                     for ipl in resp.json():
                         pce_ip_lists[ipl.get("name", "")] = ipl.get("href", "")
@@ -1810,7 +1811,7 @@ def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
             pass
         if not pce_services:
             try:
-                resp = pce.get("/sec_policy/active/services")
+                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
                 if resp.status_code == 200:
                     for svc in resp.json():
                         pce_services[svc.get("name", "")] = svc.get("href", "")
