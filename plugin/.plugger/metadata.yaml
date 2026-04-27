@@ -37,6 +37,11 @@ config:
     required: false
     type: int
     default: "3600"
+  - name: EXPORT_AS_PR
+    description: "Export changes as a Pull Request instead of pushing directly to main"
+    required: false
+    type: bool
+    default: "false"
   - name: AUTO_PROVISION
     description: Automatically provision draft to active after Git->PCE sync
     required: false
