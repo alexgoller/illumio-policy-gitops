@@ -156,6 +156,18 @@ def delete_object(pce, filepath):
     return "skip", basename
 
 
+def provision_to_active(pce, description: str):
+    """Promote all pending PCE draft changes to active policy."""
+    resp = pce.post("/sec_policy", json={"update_description": description})
+    if resp.status_code in (200, 201):
+        job = resp.json()
+        href = job.get("href", "")
+        print(f"Provisioned draft to active (job: {href})")
+        return True
+    print(f"WARNING: provision to active failed: HTTP {resp.status_code} — {resp.text[:200]}")
+    return False
+
+
 def main():
     changed_raw = os.environ.get("CHANGED_FILES", "")
     if not changed_raw.strip():
@@ -220,11 +232,24 @@ def main():
         except Exception as e:
             errors.append(f"{filepath}: {e}")
 
+    total_changes = created + updated + deleted
     print(f"\nResult: {created} created, {updated} updated, {deleted} deleted, {len(errors)} errors")
     if errors:
         for e in errors:
             print(f"  ERROR: {e}")
         sys.exit(1)
+
+    # Promote draft to active unless explicitly disabled.
+    # AUTO_PROVISION defaults to true — the script runs on merge, which implies approval.
+    auto_provision = os.environ.get("AUTO_PROVISION", "true").lower() not in ("false", "0", "no")
+    if auto_provision and total_changes > 0:
+        print("\nProvisioning draft to active...")
+        commit_msg = os.environ.get("PROVISION_DESCRIPTION",
+                                    f"GitOps: {created} created, {updated} updated, {deleted} deleted")
+        if not provision_to_active(pce, commit_msg):
+            sys.exit(1)
+    elif not auto_provision:
+        print("\nAUTO_PROVISION=false — draft changes left pending for manual review")
 
 
 if __name__ == "__main__":

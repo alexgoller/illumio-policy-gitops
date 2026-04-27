@@ -403,7 +403,7 @@ class PolicySerializer:
         # Build the result
         result = {
             "name": ruleset.get("name", "unknown"),
-            "description": ruleset.get("description", ""),
+            "description": ruleset.get("description") or "",
             "enabled": ruleset.get("enabled", True),
             "scopes": scopes_yaml,
             "rules": [],
@@ -548,7 +548,7 @@ class PolicySerializer:
         # Build ruleset payload
         result = {
             "name": yaml_data.get("name", "unknown"),
-            "description": yaml_data.get("description", ""),
+            "description": yaml_data.get("description") or "",
             "enabled": yaml_data.get("enabled", True),
             "scopes": scopes_pce,
             "rules": [],
@@ -632,7 +632,7 @@ class PolicySerializer:
 
         result = {
             "name": ip_list.get("name", "unknown"),
-            "description": ip_list.get("description", ""),
+            "description": ip_list.get("description") or "",
             "ip_ranges": clean_ranges,
         }
         if clean_fqdns:
@@ -665,7 +665,7 @@ class PolicySerializer:
 
         result = {
             "name": yaml_data.get("name", "unknown"),
-            "description": yaml_data.get("description", ""),
+            "description": yaml_data.get("description") or "",
             "ip_ranges": ip_ranges,
         }
         if fqdns:
@@ -707,7 +707,7 @@ class PolicySerializer:
 
         result = {
             "name": service.get("name", "unknown"),
-            "description": service.get("description", ""),
+            "description": service.get("description") or "",
             "service_ports": clean_ports,
         }
         if clean_windows:
@@ -735,7 +735,7 @@ class PolicySerializer:
 
         result = {
             "name": yaml_data.get("name", "unknown"),
-            "description": yaml_data.get("description", ""),
+            "description": yaml_data.get("description") or "",
             "service_ports": service_ports,
         }
 
