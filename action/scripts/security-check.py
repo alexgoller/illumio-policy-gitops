@@ -72,6 +72,17 @@ DEFAULT_RULES = [
         "action": "warn",
         "description": "IP lists with /8 or broader CIDRs are very permissive.",
     },
+    {
+        "id": "SEC-008",
+        "name": "Overly broad rule consumer",
+        "severity": "high",
+        "action": "warn",
+        "description": (
+            "Rules with 'All Workloads' or an Any/RFC-1918 IP list as consumer "
+            "and no role label on providers grant network access to everyone. "
+            "Restrict consumers to a specific role or label."
+        ),
+    },
 ]
 
 
@@ -154,10 +165,57 @@ def check_broad_cidr(ip_ranges):
         if isinstance(r, dict):
             from_ip = r.get("from_ip", "")
             if "/" in from_ip:
-                prefix = int(from_ip.split("/")[1])
-                if prefix <= 8:
-                    return from_ip
+                try:
+                    prefix = int(from_ip.split("/")[1])
+                    if prefix <= 8:
+                        return from_ip
+                except ValueError:
+                    pass
     return None
+
+
+# Names of well-known catch-all IP lists (case-insensitive prefix match)
+_BROAD_IP_LIST_NAMES = {"any", "all", "rfc1918", "0.0.0.0"}
+
+
+def check_broad_consumer(rule_data: dict) -> bool:
+    """SEC-008: Consumer is 'All Workloads' or a broad IP list with no role on providers.
+
+    Flags rules where:
+    - Consumer is ams (all workloads) OR an IP list whose name starts with
+      'any', 'all', 'rfc1918', or '0.0.0.0'
+    - AND none of the providers has a role label (meaning the rule reaches
+      every workload regardless of what it does)
+    """
+    consumers = rule_data.get("consumers", [])
+    providers = rule_data.get("providers", [])
+
+    broad_consumer = False
+    for c in consumers:
+        if not isinstance(c, dict):
+            continue
+        if c.get("actors") == "ams":
+            broad_consumer = True
+            break
+        ipl = c.get("ip_list", {})
+        if isinstance(ipl, dict):
+            name = ipl.get("name", "").lower()
+            if any(name.startswith(p) for p in _BROAD_IP_LIST_NAMES):
+                broad_consumer = True
+                break
+
+    if not broad_consumer:
+        return False
+
+    # Check if any provider has a role label — that would scope it down
+    for p in providers:
+        if not isinstance(p, dict):
+            continue
+        lbl = p.get("label", {})
+        if isinstance(lbl, dict) and "role" in lbl:
+            return False  # At least one provider has a role constraint
+
+    return True
 
 
 def _is_rule_applicable(rule_cfg: dict, is_scoped: bool) -> bool:
@@ -341,6 +399,27 @@ def analyze_file(filepath, rules, exemptions):
                     "action": cfg.get("action", "warn"),
                     "message": f"IP list contains very broad CIDR: {broad}",
                 })
+
+    # SEC-008: overly broad consumer (per-rule check for scopes/ files)
+    if "SEC-008" not in exempt_rules and "SEC-008" in rule_cfg_by_id and "scopes" in filepath:
+        cfg = rule_cfg_by_id["SEC-008"]
+        if (_is_rule_applicable(cfg, is_scoped)
+                and not _is_scope_exempt(data, exemptions, "SEC-008")):
+            for rule_data in data.get("rules", []):
+                if not isinstance(rule_data, dict):
+                    continue
+                if check_broad_consumer(rule_data):
+                    rule_name = rule_data.get("name", "(unnamed)")
+                    findings.append({
+                        "file": filepath,
+                        "rule_id": "SEC-008",
+                        "severity": cfg.get("severity", "high"),
+                        "action": cfg.get("action", "warn"),
+                        "message": (
+                            f"Rule '{rule_name}' has a broad consumer (All Workloads or catch-all IP list) "
+                            "with no role constraint on providers"
+                        ),
+                    })
 
     return findings
 

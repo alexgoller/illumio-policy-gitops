@@ -48,6 +48,8 @@ AUTO_PROVISION = os.environ.get("AUTO_PROVISION", "false").lower() in ("true", "
 DRIFT_ALERT = os.environ.get("DRIFT_ALERT", "true").lower() in ("true", "1", "yes")
 EXPORT_AS_PR = os.environ.get("EXPORT_AS_PR", "false").lower() in ("true", "1", "yes")
 EXPORT_POLICY_SCOPE = os.environ.get("EXPORT_POLICY_SCOPE", "active")  # active or draft
+EXPORT_LABELS = os.environ.get("EXPORT_LABELS", "false").lower() in ("true", "1", "yes")
+DRIFT_AUTO_PR = os.environ.get("DRIFT_AUTO_PR", "false").lower() in ("true", "1", "yes")
 
 # Protocol number to name mapping (IANA)
 PROTO_NUM_TO_NAME = {6: "tcp", 17: "udp", 1: "icmp", 58: "icmpv6"}
@@ -744,6 +746,27 @@ class PolicySerializer:
 
         return result
 
+    def export_labels_to_yaml(self, labels: list) -> dict:
+        """Group all PCE labels into a YAML-friendly dict keyed by label key.
+
+        Returns:
+            {
+                "role": ["web", "db", "app"],
+                "env":  ["prod", "dev", "staging"],
+                "app":  ["payments", "ordering"],
+            }
+        """
+        grouped = {}
+        for lbl in labels:
+            key = lbl.get("key", "")
+            value = lbl.get("value", "")
+            if key and value:
+                grouped.setdefault(key, [])
+                if value not in grouped[key]:
+                    grouped[key].append(value)
+        # Sort values within each key for stable output
+        return {k: sorted(v) for k, v in sorted(grouped.items())}
+
 
 # ===================================================================
 # ScopeMapper — map rulesets to directory paths based on scope labels
@@ -1117,6 +1140,76 @@ class GitClient:
 
         return {"url": "", "number": 0, "status": "not_supported",
                 "error": f"Provider {self.provider} not supported for PR creation"}
+
+    def delete_merged_export_branches(self, branch_prefix: str = "policy-gitops/export-",
+                                       keep_branch: str = None):
+        """Delete remote export branches whose PRs have been merged or closed.
+
+        Queries GitHub for all branches matching branch_prefix, then deletes
+        those that do not have an OPEN PR (already merged or abandoned).
+        Keeps keep_branch (the current active export branch) untouched.
+        """
+        import requests
+
+        if self.provider != "github":
+            return
+
+        match = re.search(r"github\.com[/:]([^/]+)/([^/.]+)", self.repo_url)
+        if not match:
+            return
+        owner, repo = match.group(1), match.group(2)
+        headers = {"Authorization": f"token {self.token}", "Accept": "application/json"}
+
+        try:
+            # Get all open export PRs so we know which branches to preserve
+            open_resp = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                headers=headers,
+                params={"state": "open", "per_page": 100},
+                timeout=15,
+            )
+            open_branches = set()
+            if open_resp.status_code == 200:
+                for pr in open_resp.json():
+                    ref = pr.get("head", {}).get("ref", "")
+                    if ref.startswith(branch_prefix):
+                        open_branches.add(ref)
+
+            # List all remote branches matching prefix
+            branches_resp = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo}/branches",
+                headers=headers,
+                params={"per_page": 100},
+                timeout=15,
+            )
+            if branches_resp.status_code != 200:
+                return
+
+            deleted = 0
+            for branch in branches_resp.json():
+                name = branch.get("name", "")
+                if not name.startswith(branch_prefix):
+                    continue
+                if name in open_branches:
+                    continue
+                if keep_branch and name == keep_branch:
+                    continue
+                del_resp = requests.delete(
+                    f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{name}",
+                    headers=headers,
+                    timeout=15,
+                )
+                if del_resp.status_code == 204:
+                    log.info("Deleted merged export branch: %s", name)
+                    deleted += 1
+                else:
+                    log.warning("Failed to delete branch %s: HTTP %d", name, del_resp.status_code)
+
+            if deleted:
+                log.info("Cleaned up %d stale export branch(es)", deleted)
+
+        except Exception as e:
+            log.warning("Stale branch cleanup failed: %s", e)
 
     def find_open_export_pr(self, branch_prefix: str = "policy-gitops/export-") -> dict:
         """Return the first open PR whose head branch starts with branch_prefix, or {}.
@@ -1661,6 +1754,25 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
         except Exception as e:
             log.warning("Stale file cleanup failed: %s", e)
 
+        # --- Export labels (optional, controlled by EXPORT_LABELS) ---
+        if EXPORT_LABELS:
+            try:
+                resp = pce.get("/labels")
+                if resp.status_code == 200:
+                    labels_yaml = serializer.export_labels_to_yaml(resp.json())
+                    labels_dir = repo_dir / "labels"
+                    labels_dir.mkdir(exist_ok=True)
+                    labels_path = labels_dir / "labels.yaml"
+                    labels_path.write_text(yaml.dump(
+                        labels_yaml, default_flow_style=False,
+                        sort_keys=False, allow_unicode=True,
+                    ))
+                    changed_files.append("labels/labels.yaml")
+                    log.info("Exported %d label keys to labels/labels.yaml",
+                             len(labels_yaml))
+            except Exception as e:
+                log.warning("Failed to export labels: %s", e)
+
         # --- Generate CODEOWNERS ---
         try:
             codeowners_content = scope_mapper.build_codeowners(repo_dir)
@@ -1706,6 +1818,8 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
                     )
                     export_pr_url = pr.get("url", "")
                     log.info("Created export PR: %s", export_pr_url)
+                    # Clean up stale export branches now that a fresh PR exists
+                    git_client.delete_merged_export_branches(keep_branch=export_branch)
                 else:
                     log.info("Pushed new commits onto existing export PR branch: %s", export_branch)
             else:
@@ -1990,8 +2104,14 @@ def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
             })
 
 
-def run_drift_check(pce: PolicyComputeEngine, detector: DriftDetector):
-    """Run drift detection between Git and PCE."""
+def run_drift_check(pce: PolicyComputeEngine, detector: DriftDetector,
+                    serializer: PolicySerializer = None, scope_mapper: ScopeMapper = None,
+                    git_client: GitClient = None):
+    """Run drift detection between Git and PCE.
+
+    When DRIFT_AUTO_PR=true and drift is detected, triggers an export PR so
+    the divergence is surfaced for human review rather than silently ignored.
+    """
     log.info("Running drift detection...")
     now = datetime.now(timezone.utc).isoformat()
 
@@ -2009,6 +2129,11 @@ def run_drift_check(pce: PolicyComputeEngine, detector: DriftDetector):
         drifted = [d for d in drift_items if d["status"] != "in_sync"]
         log.info("Drift check complete: %d items checked, %d drifted",
                  len(drift_items), len(drifted))
+
+        if drifted and DRIFT_AUTO_PR and serializer and scope_mapper and git_client:
+            log.info("DRIFT_AUTO_PR=true — triggering export PR for %d drifted objects",
+                     len(drifted))
+            run_export(pce, serializer, scope_mapper, git_client)
 
     except Exception as e:
         log.exception("Drift check failed")
@@ -2036,7 +2161,7 @@ def sync_loop(pce: PolicyComputeEngine, serializer: PolicySerializer,
                 run_provision(pce, serializer, scope_mapper, git_client)
 
             if DRIFT_ALERT:
-                run_drift_check(pce, detector)
+                run_drift_check(pce, detector, serializer, scope_mapper, git_client)
 
             with state_lock:
                 app_state["status"] = "idle"
@@ -2399,13 +2524,14 @@ class GitOpsHandler(BaseHTTPRequestHandler):
             self.send_json(200, data)
 
         elif path == "/api/drift":
-            # Trigger a drift check and return results
-            threading.Thread(
-                target=run_drift_check,
-                args=(self.pce, self.detector),
-                daemon=True,
-            ).start()
-            self.send_json(200, {"message": "Drift check triggered", "status": "accepted"})
+            # Return current drift state synchronously
+            with state_lock:
+                data = {
+                    "drift_items": app_state["drift_items"],
+                    "drift_count": app_state["drift_count"],
+                    "last_drift_check": app_state["last_drift_check"],
+                }
+            self.send_json(200, data)
 
         elif path == "/":
             self.send_html(DASHBOARD_HTML)
@@ -2435,7 +2561,8 @@ class GitOpsHandler(BaseHTTPRequestHandler):
         elif path == "/api/drift":
             threading.Thread(
                 target=run_drift_check,
-                args=(self.pce, self.detector),
+                args=(self.pce, self.detector,
+                      self.serializer, self.scope_mapper, self.git_client),
                 daemon=True,
             ).start()
             self.send_json(200, {"message": "Drift check triggered", "status": "accepted"})

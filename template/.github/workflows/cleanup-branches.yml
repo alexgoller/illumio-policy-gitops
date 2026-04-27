@@ -1,0 +1,45 @@
+name: Cleanup Stale Export Branches
+
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    # Daily at 02:00 UTC — catches any branches orphaned by manual PR closes
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    name: Delete merged policy-gitops export branches
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete stale export branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # List all remote branches matching the export pattern
+          BRANCHES=$(gh api repos/${{ github.repository }}/git/refs/heads \
+            --jq '.[].ref | select(startswith("refs/heads/policy-gitops/export-"))' \
+            | sed 's|refs/heads/||')
+
+          if [ -z "$BRANCHES" ]; then
+            echo "No export branches found — nothing to clean up"
+            exit 0
+          fi
+
+          DELETED=0
+          for BRANCH in $BRANCHES; do
+            # Check if an open PR references this branch
+            OPEN=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+            if [ "$OPEN" = "0" ]; then
+              echo "Deleting $BRANCH (no open PR)"
+              gh api -X DELETE repos/${{ github.repository }}/git/refs/heads/$BRANCH && DELETED=$((DELETED+1)) || true
+            else
+              echo "Keeping $BRANCH ($OPEN open PR)"
+            fi
+          done
+
+          echo "Cleanup complete — $DELETED branch(es) deleted"
