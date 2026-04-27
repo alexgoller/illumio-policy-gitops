@@ -1,8 +1,12 @@
-# Policy GitOps
+# Illumio Policy GitOps
 
-Policy-as-code for Illumio PCE segmentation policy. Export policy to Git as structured YAML, enforce multi-team change review through pull requests, detect drift between Git and the PCE, and provision approved changes back automatically.
+Policy-as-code and approval workflow for Illumio PCE segmentation policy. Two components:
 
-> **Note:** This plugin is being evaluated for extraction into its own standalone repository. The README is written to be self-contained -- everything needed to understand, deploy, and operate the system is documented here.
+1. **Policy GitOps** (`plugin/`) — Export policy to Git as structured YAML, enforce multi-team review via PRs with CODEOWNERS, security checks, traffic evidence, and auto-provisioning on merge.
+
+2. **Policy Workflow** (`workflow/`) — Approval bridge for policy changes. Detects draft changes, classifies risk, routes to Slack/ServiceNow/webhooks for approval, provisions on approval.
+
+Both work independently or together. Use GitOps for Git-native teams, Workflow for ITSM-native teams, or both for defense in depth.
 
 ---
 
