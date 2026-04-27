@@ -1442,6 +1442,78 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
         except Exception as e:
             log.warning("Failed to generate CODEOWNERS: %s", e)
 
+        # --- Remove stale files (objects deleted from PCE) ---
+        deleted_count = 0
+        try:
+            # Build sets of filenames we just wrote
+            written_files = set(os.path.basename(f) for f in changed_files)
+
+            # Check scopes/ for stale rulesets
+            scopes_dir = repo_dir / "scopes"
+            if scopes_dir.exists():
+                for yaml_file in scopes_dir.rglob("*.yaml"):
+                    if yaml_file.name == "_scope.yaml":
+                        continue
+                    if yaml_file.name not in written_files:
+                        # Verify it's actually a ruleset file (has 'name' and 'rules')
+                        try:
+                            content = yaml.safe_load(yaml_file.read_text())
+                            if isinstance(content, dict) and "rules" in content:
+                                rel = str(yaml_file.relative_to(repo_dir))
+                                log.info("Removing stale ruleset file: %s", rel)
+                                yaml_file.unlink()
+                                changed_files.append(rel)
+                                deleted_count += 1
+                        except Exception:
+                            pass
+
+            # Check ip-lists/ for stale IP lists
+            iplists_dir = repo_dir / "ip-lists"
+            if iplists_dir.exists():
+                for yaml_file in iplists_dir.glob("*.yaml"):
+                    if yaml_file.name not in written_files:
+                        rel = str(yaml_file.relative_to(repo_dir))
+                        log.info("Removing stale IP list file: %s", rel)
+                        yaml_file.unlink()
+                        changed_files.append(rel)
+                        deleted_count += 1
+
+            # Check services/ for stale services
+            services_dir = repo_dir / "services"
+            if services_dir.exists():
+                for yaml_file in services_dir.glob("*.yaml"):
+                    if yaml_file.name not in written_files:
+                        rel = str(yaml_file.relative_to(repo_dir))
+                        log.info("Removing stale service file: %s", rel)
+                        yaml_file.unlink()
+                        changed_files.append(rel)
+                        deleted_count += 1
+
+            # Remove empty scope directories (no more rulesets, only _scope.yaml)
+            if scopes_dir.exists():
+                for scope_dir in scopes_dir.iterdir():
+                    if scope_dir.is_dir() and scope_dir.name != "_global":
+                        yaml_files = [f for f in scope_dir.glob("*.yaml") if f.name != "_scope.yaml"]
+                        if not yaml_files:
+                            # Remove _scope.yaml and the empty dir
+                            scope_yaml = scope_dir / "_scope.yaml"
+                            if scope_yaml.exists():
+                                scope_yaml.unlink()
+                                changed_files.append(str(scope_yaml.relative_to(repo_dir)))
+                            for gitkeep in scope_dir.glob(".gitkeep"):
+                                gitkeep.unlink()
+                            try:
+                                scope_dir.rmdir()
+                                log.info("Removed empty scope directory: %s", scope_dir.name)
+                            except OSError:
+                                pass
+
+            if deleted_count > 0:
+                log.info("Removed %d stale files from repo", deleted_count)
+
+        except Exception as e:
+            log.warning("Stale file cleanup failed: %s", e)
+
         # --- Commit and push ---
         total = counts["rulesets"] + counts["ip_lists"] + counts["services"]
         commit_msg = (
@@ -1450,6 +1522,8 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
             f"{counts['ip_lists']} IP lists, "
             f"{counts['services']} services"
         )
+        if deleted_count > 0:
+            commit_msg += f"\nRemoved {deleted_count} stale files"
 
         if EXPORT_AS_PR:
             # Create a branch, commit there, push, and open a PR
