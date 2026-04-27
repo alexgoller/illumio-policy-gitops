@@ -1953,6 +1953,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
                 <h2 style="margin-bottom:0;">Export Status (PCE -> Git)</h2>
                 <button class="btn btn-primary" onclick="triggerExport()">Run Export</button>
+                <button class="btn" style="margin-left:8px;background:#6c7086;" onclick="triggerReconcile()">Full Reconcile</button>
             </div>
             <div class="kv"><span class="kv-key">Last export</span><span class="kv-val" id="last-export">never</span></div>
             <div class="kv"><span class="kv-key">Export count</span><span class="kv-val" id="export-count">0</span></div>
@@ -2135,6 +2136,17 @@ async function triggerExport() {
     }
 }
 
+async function triggerReconcile() {
+    try {
+        const resp = await fetch(BASE + '/api/reconcile', { method: 'POST' });
+        const data = await resp.json();
+        alert(data.message || 'Reconcile triggered');
+        setTimeout(fetchState, 2000);
+    } catch (e) {
+        alert('Failed to trigger reconcile: ' + e);
+    }
+}
+
 async function triggerProvision() {
     if (!confirm('Provision policy from Git to PCE? This will modify PCE draft policy.')) return;
     try {
@@ -2224,6 +2236,13 @@ class GitOpsHandler(BaseHTTPRequestHandler):
                 daemon=True,
             ).start()
             self.send_json(200, {"message": "Drift check triggered", "status": "accepted"})
+
+        elif path == "/api/reconcile":
+            # Full reconcile: export + delete stale files + commit + PR/push
+            def _reconcile():
+                run_export(self.pce, self.serializer, self.scope_mapper, self.git_client)
+            threading.Thread(target=_reconcile, daemon=True).start()
+            self.send_json(200, {"message": "Reconcile triggered (export + cleanup)", "status": "accepted"})
 
         else:
             self.send_error(404)
