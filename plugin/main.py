@@ -44,7 +44,6 @@ GIT_BRANCH = os.environ.get("GIT_BRANCH", "main")
 GIT_PROVIDER = os.environ.get("GIT_PROVIDER", "github")
 SYNC_MODE = os.environ.get("SYNC_MODE", "export")
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "3600"))
-AUTO_PROVISION = os.environ.get("AUTO_PROVISION", "false").lower() in ("true", "1", "yes")
 DRIFT_ALERT = os.environ.get("DRIFT_ALERT", "true").lower() in ("true", "1", "yes")
 EXPORT_AS_PR = os.environ.get("EXPORT_AS_PR", "false").lower() in ("true", "1", "yes")
 EXPORT_POLICY_SCOPE = os.environ.get("EXPORT_POLICY_SCOPE", "active")  # active or draft
@@ -86,10 +85,6 @@ app_state = {
     "drift_items": [],           # [{type, name, status, detail}]
     "last_drift_check": None,
     "drift_count": 0,
-    # Provisioning tracking
-    "last_provision": None,
-    "provision_count": 0,
-    "provision_history": [],     # [{timestamp, objects, status, detail}]
 }
 
 
@@ -1909,255 +1904,6 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
                 log.warning("Failed to return to base branch after export: %s", e)
 
 
-def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
-                  scope_mapper: ScopeMapper, git_client: GitClient):
-    """Provision policy from Git to PCE (Git -> PCE direction).
-
-    Reads YAML files from the repo, resolves label/service references,
-    creates or updates rulesets, IP lists, and services on the PCE draft,
-    and optionally provisions draft -> active.
-    """
-    log.info("Starting provision (Git -> PCE)...")
-    now = datetime.now(timezone.utc).isoformat()
-    provisioned_objects = 0
-    errors = []
-
-    try:
-        # Pull latest from Git
-        git_client.pull()
-
-        # Refresh caches for resolution
-        serializer.refresh_all_caches()
-
-        repo_dir = git_client.repo_dir
-
-        # Build a map of existing PCE rulesets/ip_lists/services by name for update detection
-        pce_rulesets = {}    # name -> href
-        pce_ip_lists = {}    # name -> href
-        pce_services = {}    # name -> href
-
-        try:
-            resp = pce.get("/sec_policy/draft/rule_sets", params={"max_results": 5000})
-            if resp.status_code == 200:
-                for rs in resp.json():
-                    pce_rulesets[rs.get("name", "")] = rs.get("href", "")
-        except Exception as e:
-            log.warning("Failed to fetch draft rulesets: %s", e)
-
-        # Fall back to active if draft is empty
-        if not pce_rulesets:
-            try:
-                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/rule_sets", params={"max_results": 5000})
-                if resp.status_code == 200:
-                    for rs in resp.json():
-                        pce_rulesets[rs.get("name", "")] = rs.get("href", "")
-            except Exception:
-                pass
-
-        try:
-            resp = pce.get("/sec_policy/draft/ip_lists")
-            if resp.status_code == 200:
-                for ipl in resp.json():
-                    pce_ip_lists[ipl.get("name", "")] = ipl.get("href", "")
-        except Exception:
-            pass
-        if not pce_ip_lists:
-            try:
-                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
-                if resp.status_code == 200:
-                    for ipl in resp.json():
-                        pce_ip_lists[ipl.get("name", "")] = ipl.get("href", "")
-            except Exception:
-                pass
-
-        try:
-            resp = pce.get("/sec_policy/draft/services")
-            if resp.status_code == 200:
-                for svc in resp.json():
-                    pce_services[svc.get("name", "")] = svc.get("href", "")
-        except Exception:
-            pass
-        if not pce_services:
-            try:
-                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
-                if resp.status_code == 200:
-                    for svc in resp.json():
-                        pce_services[svc.get("name", "")] = svc.get("href", "")
-            except Exception:
-                pass
-
-        provisioned_hrefs = []  # for optional bulk provision at end
-
-        # --- Provision services (must come first, rulesets may reference them) ---
-        services_dir = repo_dir / "services"
-        if services_dir.is_dir():
-            for yaml_file in sorted(services_dir.glob("*.yaml")):
-                try:
-                    data = yaml.safe_load(yaml_file.read_text())
-                    if not data or not isinstance(data, dict):
-                        continue
-                    name = data.get("name", yaml_file.stem)
-                    payload = serializer.import_yaml_to_service(data)
-
-                    if name in pce_services:
-                        href = pce_services[name]
-                        resp = pce.put(href, json=payload)
-                        if resp.status_code in (200, 201, 204):
-                            log.info("Updated service: %s", name)
-                            provisioned_objects += 1
-                        else:
-                            errors.append(f"Update service {name}: HTTP {resp.status_code}")
-                    else:
-                        resp = pce.post("/sec_policy/draft/services", json=payload)
-                        if resp.status_code in (200, 201):
-                            href = resp.json().get("href", "")
-                            log.info("Created service: %s -> %s", name, href)
-                            provisioned_objects += 1
-                            # Update cache for later ruleset resolution
-                            serializer._service_cache[href] = resp.json()
-                        else:
-                            errors.append(f"Create service {name}: HTTP {resp.status_code}")
-                except Exception as e:
-                    errors.append(f"Service {yaml_file.name}: {e}")
-
-        # --- Provision IP lists ---
-        ip_lists_dir = repo_dir / "ip-lists"
-        if ip_lists_dir.is_dir():
-            for yaml_file in sorted(ip_lists_dir.glob("*.yaml")):
-                try:
-                    data = yaml.safe_load(yaml_file.read_text())
-                    if not data or not isinstance(data, dict):
-                        continue
-                    name = data.get("name", yaml_file.stem)
-                    payload = serializer.import_yaml_to_ip_list(data)
-
-                    if name in pce_ip_lists:
-                        href = pce_ip_lists[name]
-                        resp = pce.put(href, json=payload)
-                        if resp.status_code in (200, 201, 204):
-                            log.info("Updated IP list: %s", name)
-                            provisioned_objects += 1
-                        else:
-                            errors.append(f"Update IP list {name}: HTTP {resp.status_code}")
-                    else:
-                        resp = pce.post("/sec_policy/draft/ip_lists", json=payload)
-                        if resp.status_code in (200, 201):
-                            href = resp.json().get("href", "")
-                            log.info("Created IP list: %s -> %s", name, href)
-                            provisioned_objects += 1
-                            serializer._ip_list_cache[href] = resp.json()
-                        else:
-                            errors.append(f"Create IP list {name}: HTTP {resp.status_code}")
-                except Exception as e:
-                    errors.append(f"IP list {yaml_file.name}: {e}")
-
-        # --- Provision rulesets ---
-        scopes_dir = repo_dir / "scopes"
-        if scopes_dir.is_dir():
-            for yaml_file in sorted(scopes_dir.rglob("*.yaml")):
-                if yaml_file.name.startswith("_"):
-                    continue
-                try:
-                    data = yaml.safe_load(yaml_file.read_text())
-                    if not data or not isinstance(data, dict):
-                        continue
-                    # Only process files that look like rulesets (have rules key)
-                    if "rules" not in data:
-                        continue
-
-                    name = data.get("name", yaml_file.stem)
-
-                    # If scope info is not in the YAML, try to infer from _scope.yaml
-                    if not data.get("scopes"):
-                        scope_labels = scope_mapper.resolve_scope_labels(
-                            str(yaml_file.parent)
-                        )
-                        if scope_labels:
-                            data["scopes"] = [
-                                [{"label": lbl} for lbl in scope_labels]
-                            ]
-
-                    payload = serializer.import_yaml_to_ruleset(data)
-
-                    if name in pce_rulesets:
-                        href = pce_rulesets[name]
-                        resp = pce.put(href, json=payload)
-                        if resp.status_code in (200, 201, 204):
-                            log.info("Updated ruleset: %s", name)
-                            provisioned_objects += 1
-                            provisioned_hrefs.append(href)
-                        else:
-                            errors.append(f"Update ruleset {name}: HTTP {resp.status_code}")
-                    else:
-                        resp = pce.post("/sec_policy/draft/rule_sets", json=payload)
-                        if resp.status_code in (200, 201):
-                            href = resp.json().get("href", "")
-                            log.info("Created ruleset: %s -> %s", name, href)
-                            provisioned_objects += 1
-                            provisioned_hrefs.append(href)
-                        else:
-                            errors.append(f"Create ruleset {name}: HTTP {resp.status_code}")
-                except Exception as e:
-                    errors.append(f"Ruleset {yaml_file.name}: {e}")
-
-        # --- Optionally provision draft -> active ---
-        provision_status = "draft_only"
-        if AUTO_PROVISION and provisioned_objects > 0:
-            try:
-                provision_data = {
-                    "update_description": f"policy-gitops provision at {now}",
-                }
-                # If we have specific hrefs, do a targeted provision
-                if provisioned_hrefs:
-                    provision_data["change_subset"] = {
-                        "rule_sets": [{"href": h} for h in provisioned_hrefs]
-                    }
-
-                resp = pce.post("/sec_policy", json=provision_data)
-                if resp.status_code in (200, 201, 204):
-                    log.info("Provisioned draft -> active")
-                    provision_status = "provisioned"
-                else:
-                    error_msg = f"Provision draft->active: HTTP {resp.status_code}"
-                    errors.append(error_msg)
-                    provision_status = "provision_failed"
-            except Exception as e:
-                errors.append(f"Provision draft->active: {e}")
-                provision_status = "provision_failed"
-
-        # Build result
-        status_str = provision_status
-        if errors:
-            status_str += f" ({len(errors)} errors)"
-        detail = "; ".join(errors[:10]) if errors else f"{provisioned_objects} objects synced"
-
-        provision_entry = {
-            "timestamp": now,
-            "objects": provisioned_objects,
-            "status": status_str,
-            "detail": detail,
-        }
-
-        with state_lock:
-            app_state["last_provision"] = now
-            app_state["provision_count"] += 1
-            app_state["provision_history"].append(provision_entry)
-            if len(app_state["provision_history"]) > 50:
-                app_state["provision_history"] = app_state["provision_history"][-50:]
-            app_state["last_error"] = errors[0] if errors else None
-
-        log.info("Provision complete: %d objects, status=%s", provisioned_objects, status_str)
-
-    except Exception as e:
-        log.exception("Provision failed")
-        with state_lock:
-            app_state["last_error"] = f"Provision failed: {e}"
-            app_state["provision_history"].append({
-                "timestamp": now, "objects": 0,
-                "status": "failed", "detail": str(e),
-            })
-
-
 def run_drift_check(pce: PolicyComputeEngine, detector: DriftDetector,
                     serializer: PolicySerializer = None, scope_mapper: ScopeMapper = None,
                     git_client: GitClient = None):
@@ -2210,9 +1956,6 @@ def sync_loop(pce: PolicyComputeEngine, serializer: PolicySerializer,
 
             if SYNC_MODE in ("export", "bidirectional"):
                 run_export(pce, serializer, scope_mapper, git_client)
-
-            if SYNC_MODE in ("provision", "bidirectional"):
-                run_provision(pce, serializer, scope_mapper, git_client)
 
             if DRIFT_ALERT:
                 run_drift_check(pce, detector, serializer, scope_mapper, git_client)
@@ -2309,10 +2052,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="stat-value" id="stat-drift">0</div>
                 <div class="stat-label">Drift Items</div>
             </div>
-            <div class="stat">
-                <div class="stat-value" id="stat-provisions">0</div>
-                <div class="stat-label">Provisions</div>
-            </div>
         </div>
     </div>
 
@@ -2320,7 +2059,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="tabs">
         <div class="tab active" data-tab="export">Export Status</div>
         <div class="tab" data-tab="drift">Drift Report</div>
-        <div class="tab" data-tab="provision">Provisioning</div>
         <div class="tab" data-tab="config">Config</div>
     </div>
 
@@ -2348,28 +2086,19 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="card fade-in">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
                 <h2 style="margin-bottom:0;">Drift Report (Git vs PCE)</h2>
-                <span style="color:#6b7280;font-size:12px;" id="drift-time">Last check: never</span>
+                <div style="display:flex;gap:8px;align-items:center;">
+                    <span style="color:#6b7280;font-size:12px;" id="drift-time">Last check: never</span>
+                    <button class="btn" onclick="triggerDriftCheck()">Check Now</button>
+                    <button class="btn btn-primary" id="fix-drift-btn" onclick="fixDrift()" style="display:none;">Export PR to Fix Drift</button>
+                </div>
+            </div>
+            <div id="drift-info" style="display:none;background:#1e3a5f;border:1px solid #3b82f6;border-radius:6px;padding:12px;margin-bottom:16px;font-size:13px;color:#93c5fd;">
+                PCE has changes not reflected in Git.
+                Click <strong>Export PR to Fix Drift</strong> to create a PR with the delta — review and merge to accept PCE changes,
+                or close the PR and use the GitHub Action provision workflow to push Git state back to PCE.
             </div>
             <div id="drift-table-container">
                 <div class="empty">No drift items detected (or sync has not run yet).</div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Provision Tab -->
-    <div class="tab-content" id="tab-provision">
-        <div class="card fade-in">
-            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
-                <h2 style="margin-bottom:0;">Provisioning (Git -> PCE)</h2>
-                <button class="btn btn-primary" onclick="triggerProvision()">Run Provision</button>
-            </div>
-            <div class="kv"><span class="kv-key">Last provision</span><span class="kv-val" id="last-provision">never</span></div>
-            <div class="kv"><span class="kv-key">Provision count</span><span class="kv-val" id="provision-count">0</span></div>
-            <div class="kv"><span class="kv-key">Auto-provision</span><span class="kv-val" id="auto-provision">-</span></div>
-
-            <h2 style="margin-top:24px;">History</h2>
-            <div id="provision-history">
-                <div class="empty">No provisioning history yet.</div>
             </div>
         </div>
     </div>
@@ -2452,7 +2181,6 @@ async function fetchState() {
         // Stats
         document.getElementById('stat-exports').textContent = s.export_count;
         document.getElementById('stat-drift').textContent = s.drift_count;
-        document.getElementById('stat-provisions').textContent = s.provision_count;
 
         // Export tab
         document.getElementById('last-export').textContent = fmt(s.last_export);
@@ -2465,8 +2193,11 @@ async function fetchState() {
 
         // Drift tab
         document.getElementById('drift-time').textContent = 'Last check: ' + fmt(s.last_drift_check);
+        const hasDrift = s.drift_items && s.drift_items.length > 0;
+        document.getElementById('fix-drift-btn').style.display = hasDrift ? '' : 'none';
+        document.getElementById('drift-info').style.display = hasDrift ? '' : 'none';
         const driftContainer = document.getElementById('drift-table-container');
-        if (s.drift_items && s.drift_items.length > 0) {
+        if (hasDrift) {
             let html = '<table><thead><tr><th>Type</th><th>Name</th><th>Status</th><th>Detail</th></tr></thead><tbody>';
             s.drift_items.forEach(d => {
                 html += `<tr><td>${d.type}</td><td><code>${d.name}</code></td><td>${driftBadge(d.status)}</td><td>${d.detail || ''}</td></tr>`;
@@ -2475,22 +2206,6 @@ async function fetchState() {
             driftContainer.innerHTML = html;
         } else {
             driftContainer.innerHTML = '<div class="empty">No drift items detected (or sync has not run yet).</div>';
-        }
-
-        // Provision tab
-        document.getElementById('last-provision').textContent = fmt(s.last_provision);
-        document.getElementById('provision-count').textContent = s.provision_count;
-        document.getElementById('auto-provision').textContent = s.auto_provision || 'false';
-        const phContainer = document.getElementById('provision-history');
-        if (s.provision_history && s.provision_history.length > 0) {
-            let html = '<table><thead><tr><th>Time</th><th>Objects</th><th>Status</th><th>Detail</th></tr></thead><tbody>';
-            s.provision_history.slice().reverse().forEach(p => {
-                html += `<tr><td>${fmt(p.timestamp)}</td><td>${p.objects}</td><td>${p.status}</td><td>${p.detail || ''}</td></tr>`;
-            });
-            html += '</tbody></table>';
-            phContainer.innerHTML = html;
-        } else {
-            phContainer.innerHTML = '<div class="empty">No provisioning history yet.</div>';
         }
 
         // Config tab
@@ -2529,15 +2244,25 @@ async function triggerReconcile() {
     }
 }
 
-async function triggerProvision() {
-    if (!confirm('Provision policy from Git to PCE? This will modify PCE draft policy.')) return;
+async function triggerDriftCheck() {
     try {
-        const resp = await fetch(BASE + '/api/provision', { method: 'POST' });
+        const resp = await fetch(BASE + '/api/drift', { method: 'POST' });
         const data = await resp.json();
-        alert(data.message || 'Provision triggered');
+        setTimeout(fetchState, 2000);
+    } catch (e) {
+        alert('Failed to trigger drift check: ' + e);
+    }
+}
+
+async function fixDrift() {
+    if (!confirm('Create an Export PR with the current PCE-vs-Git delta?\\n\\nMerge the PR to accept PCE changes, or close it and use the GitHub Action to push Git state back to PCE.')) return;
+    try {
+        const resp = await fetch(BASE + '/api/export', { method: 'POST' });
+        const data = await resp.json();
+        alert(data.message || 'Export triggered — check your repository for a new PR');
         setTimeout(fetchState, 1000);
     } catch (e) {
-        alert('Failed to trigger provision: ' + e);
+        alert('Failed to trigger export: ' + e);
     }
 }
 
@@ -2572,7 +2297,6 @@ class GitOpsHandler(BaseHTTPRequestHandler):
         elif path == "/api/state":
             with state_lock:
                 data = dict(app_state)
-                data["auto_provision"] = str(AUTO_PROVISION).lower()
                 data["scan_interval"] = SCAN_INTERVAL
                 data["drift_alert"] = str(DRIFT_ALERT).lower()
             self.send_json(200, data)
@@ -2603,14 +2327,6 @@ class GitOpsHandler(BaseHTTPRequestHandler):
                 daemon=True,
             ).start()
             self.send_json(200, {"message": "Export triggered", "status": "accepted"})
-
-        elif path == "/api/provision":
-            threading.Thread(
-                target=run_provision,
-                args=(self.pce, self.serializer, self.scope_mapper, self.git_client),
-                daemon=True,
-            ).start()
-            self.send_json(200, {"message": "Provision triggered", "status": "accepted"})
 
         elif path == "/api/drift":
             threading.Thread(
@@ -2664,7 +2380,6 @@ def main():
     log.info("  GIT_BRANCH=%s", GIT_BRANCH)
     log.info("  GIT_PROVIDER=%s", GIT_PROVIDER)
     log.info("  SCAN_INTERVAL=%ds", SCAN_INTERVAL)
-    log.info("  AUTO_PROVISION=%s", AUTO_PROVISION)
     log.info("  DRIFT_ALERT=%s", DRIFT_ALERT)
 
     port = int(os.environ.get("HTTP_PORT", "8080"))
