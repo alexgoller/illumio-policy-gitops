@@ -13,6 +13,7 @@ Both work independently or together. Use GitOps for Git-native teams, Workflow f
 ## Table of Contents
 
 - [Problem Statement](#problem-statement)
+- [How This Relates to PCE Versioning](#how-this-relates-to-pce-versioning)
 - [How It Works](#how-it-works)
 - [Architecture](#architecture)
 - [Scope Concepts](#scope-concepts)
@@ -32,7 +33,11 @@ Both work independently or together. Use GitOps for Git-native teams, Workflow f
 
 ## Problem Statement
 
-Illumio PCE policy is managed through a GUI or REST API. There is no version control, no peer review process, no multi-team approval workflow, and no audit trail beyond PCE events. When multiple teams own different parts of the policy (different application scopes), cross-scope rules require out-of-band coordination -- Slack messages, email threads, tickets that nobody can find six months later.
+Illumio PCE has built-in policy versioning through its draft/active model, and its event log records who provisioned what. For single-team environments where one group owns all policy, PCE's native capabilities are often sufficient.
+
+The gap appears at scale. When multiple teams own different application scopes, PCE's RBAC controls who can edit, but provides no cross-team review gate. Team A can create extra-scope rules that touch Team B's applications without Team B ever approving — or even knowing. There is no peer review step between draft and active. Auditors asking for evidence of change review processes find PCE events, but not the review thread where a second engineer signed off. And organizations running multiple PCEs (prod, DR, dev, regional) have no single source of truth for keeping policy consistent across environments.
+
+Cross-scope rules require out-of-band coordination -- Slack messages, email threads, tickets that nobody can find six months later.
 
 **Who feels this pain:**
 
@@ -48,6 +53,48 @@ Illumio PCE policy is managed through a GUI or REST API. There is no version con
 - Pull request workflow with automated security checks, traffic evidence, and CODEOWNERS-enforced reviews
 - Drift detection between Git and PCE to catch out-of-band GUI changes
 - Automated provisioning on merge -- approved policy goes live without manual intervention
+
+---
+
+## How This Relates to PCE Versioning
+
+Illumio PCE has its own versioning model: the draft/active policy separation records every provisioning event with a timestamp and the user who triggered it. This is solid, mature versioning. This project does not replace it.
+
+What this project adds is a **review layer** between authoring and provisioning:
+
+| Capability | PCE native | This project |
+|---|---|---|
+| Policy versioning | Yes (draft/active history) | Additive (Git history + PR reviews) |
+| Who changed what | Yes (PCE event log) | Additive (Git blame, PR audit trail) |
+| Peer review gate | No | Yes (GitHub PRs + required approvals) |
+| Cross-team approval | No | Yes (CODEOWNERS enforces ownership) |
+| External audit trail | No (requires PCE access) | Yes (Git log is self-contained) |
+| CI/CD validation | No | Yes (security checks, traffic evidence) |
+| Multi-PCE consistency | No | Yes (Git is the single source of truth) |
+| IaC integration | No | Yes (YAML in Git alongside Terraform etc.) |
+
+**When to use this project:**
+
+- Multiple teams own different application scopes and need enforced cross-team review
+- Compliance frameworks (SOC 2, PCI-DSS, HIPAA) require evidence of peer review on policy changes
+- Policy should live in Git alongside infrastructure-as-code (Terraform, Ansible, Helm)
+- Multiple PCE environments (prod, DR, dev, regional) need a single source of truth
+- Out-of-band GUI changes are a recurring problem and drift detection is wanted
+
+**When PCE native is sufficient:**
+
+- Single team owns all policy and internal review processes are informal
+- PCE event logs satisfy audit requirements without external evidence
+- No requirement for policy-as-code discipline or IaC integration
+
+**The sync model:**
+
+PCE remains the enforcement engine and the runtime source of truth. Git adds the review and CI layer. The plugin provisions to PCE draft (preserving PCE's own draft/active workflow), so nothing bypasses PCE versioning -- it extends it with an upstream approval gate.
+
+```
+Author edits YAML → opens PR → CI validates → team approves
+       → merge → plugin provisions to PCE draft → PCE draft → active
+```
 
 ---
 
@@ -104,8 +151,8 @@ Illumio PCE policy is managed through a GUI or REST API. There is no version con
                     |  (illumio-policy)              |
                     |                               |
                     |  scopes/                      |
-                    |    payments-prod/              |
-                    |    shareddb-prod/              |
+                    |    app-payments_env-prod/      |
+                    |    app-shareddb_env-prod/      |
                     |  ip-lists/                    |
                     |  services/                    |
                     |  CODEOWNERS                   |
@@ -128,12 +175,12 @@ Scopes are the fundamental organizational unit. A scope is a set of Illumio labe
 
 ### Intra-Scope Rules
 
-Rules where both consumers and providers are within the same scope. These are the most common rules -- for example, allowing the `web` role to talk to the `app` role on port 8443, all within the `payments-prod` scope.
+Rules where both consumers and providers are within the same scope. These are the most common rules -- for example, allowing the `web` role to talk to the `app` role on port 8443, all within the `app=payments, env=prod` scope.
 
 Intra-scope rules live directly in the scope directory:
 
 ```
-scopes/payments-prod/intra-rules.yaml
+scopes/app-payments_env-prod/intra-rules.yaml
 ```
 
 Only the owning team (`@org/payments-team`) needs to approve changes to these rules.
@@ -145,8 +192,8 @@ Rules where consumers are outside the scope boundary (`unscoped_consumers: true`
 Extra-scope rules are stored in a `cross-scope/` subdirectory of the requester's scope and an `inbound/` subdirectory of the target scope:
 
 ```
-scopes/payments-prod/cross-scope/to-shareddb.yaml    (requester side)
-scopes/shareddb-prod/inbound/from-payments.yaml      (target side, mirror)
+scopes/app-payments_env-prod/cross-scope/to-shareddb.yaml    (requester side)
+scopes/app-shareddb_env-prod/inbound/from-payments.yaml      (target side, mirror)
 ```
 
 Both teams must approve via CODEOWNERS, plus the security team reviews all cross-scope rules.
@@ -163,12 +210,14 @@ Global rulesets require security team approval.
 
 ### How Scopes Map to Directories
 
-The plugin builds directory names from a ruleset's scope labels. A ruleset scoped to `app=payments, env=prod` maps to the directory `scopes/payments-prod/`. The mapping logic:
+The plugin builds directory names from a ruleset's scope labels. A ruleset scoped to `app=payments, env=prod` maps to the directory `scopes/app-payments_env-prod/`. The mapping logic:
 
 1. Read the first scope entry's labels from the ruleset
-2. Extract the label values (e.g., `payments`, `prod`)
-3. Join them with hyphens and sanitize to filesystem-safe characters
+2. For each label, format as `key-value` (e.g., `app-payments`, `env-prod`)
+3. Join the pairs with underscores: `app-payments_env-prod`
 4. If no scope labels exist, map to `scopes/_global/`
+
+This format is self-documenting — the directory name tells you both the label key and value without opening `_scope.yaml`. It also avoids ambiguity when different label keys share the same value (e.g., `loc=prod` vs `env=prod`).
 
 Each scope directory contains a `_scope.yaml` file that defines the scope's labels and team ownership. This file is auto-generated during export and can be manually edited to assign owners.
 
@@ -210,19 +259,19 @@ illumio-policy/                          <- The customer's policy repo
 |   |   +-- default.yaml                 <- Default rules (e.g., DNS, NTP)
 |   |   +-- coreservices.yaml            <- Core infrastructure rules (AD, SCCM)
 |   |
-|   +-- payments-prod/                   <- Team A's application scope
+|   +-- app-payments_env-prod/            <- Team A's application scope (app=payments, env=prod)
 |   |   +-- _scope.yaml                  <- Scope definition (labels, owners)
 |   |   +-- intra-rules.yaml             <- Intra-scope rules (web->app->db)
 |   |   +-- cross-scope/
 |   |       +-- to-shareddb.yaml         <- Cross-scope rule request (outbound)
 |   |
-|   +-- shareddb-prod/                   <- Team B's application scope
+|   +-- app-shareddb_env-prod/           <- Team B's application scope (app=shareddb, env=prod)
 |   |   +-- _scope.yaml
 |   |   +-- intra-rules.yaml
 |   |   +-- inbound/
 |   |       +-- from-payments.yaml       <- Approved inbound cross-scope rule
 |   |
-|   +-- ordering-prod/                   <- Team C's application scope
+|   +-- app-ordering_env-prod/           <- Team C's application scope (app=ordering, env=prod)
 |       +-- _scope.yaml
 |       +-- intra-rules.yaml
 |
@@ -571,10 +620,10 @@ services/               @org/security-team
 .illumio/               @org/security-team
 
 # Per-scope ownership -- each team owns their application scope
-scopes/payments-prod/   @org/payments-team
-scopes/shareddb-prod/   @org/database-team
-scopes/ordering-prod/   @org/ordering-team
-scopes/frontend-prod/   @org/frontend-team
+scopes/app-payments_env-prod/   @org/payments-team
+scopes/app-shareddb_env-prod/   @org/database-team
+scopes/app-ordering_env-prod/   @org/ordering-team
+scopes/app-frontend_env-prod/   @org/frontend-team
 
 # Cross-scope rules always require security team review
 scopes/*/cross-scope/   @org/security-team
@@ -585,13 +634,13 @@ scopes/*/inbound/       @org/security-team
 
 **Scenario 1: Intra-scope change (simple)**
 
-An engineer on the payments team adds a new rule to `scopes/payments-prod/intra-rules.yaml`. CODEOWNERS matches `scopes/payments-prod/` and requires `@org/payments-team` to review. Since the author is on that team, the PR can be approved by any teammate.
+An engineer on the payments team adds a new rule to `scopes/app-payments_env-prod/intra-rules.yaml`. CODEOWNERS matches `scopes/app-payments_env-prod/` and requires `@org/payments-team` to review. Since the author is on that team, the PR can be approved by any teammate.
 
 **Scenario 2: Cross-scope change (multi-team)**
 
 An engineer creates a cross-scope rule from payments to shareddb. The PR contains two files:
-- `scopes/payments-prod/cross-scope/to-shareddb.yaml` -- matches `scopes/payments-prod/` (payments team) AND `scopes/*/cross-scope/` (security team)
-- `scopes/shareddb-prod/inbound/from-payments.yaml` -- matches `scopes/shareddb-prod/` (database team) AND `scopes/*/inbound/` (security team)
+- `scopes/app-payments_env-prod/cross-scope/to-shareddb.yaml` -- matches `scopes/app-payments_env-prod/` (payments team) AND `scopes/*/cross-scope/` (security team)
+- `scopes/app-shareddb_env-prod/inbound/from-payments.yaml` -- matches `scopes/app-shareddb_env-prod/` (database team) AND `scopes/*/inbound/` (security team)
 
 Three approvals are required:
 1. `@org/payments-team` -- owns the requester scope
@@ -602,8 +651,8 @@ Three approvals are required:
 
 ```
 1. Team A (payments) creates a branch and adds two files:
-   - scopes/payments-prod/cross-scope/to-shareddb.yaml
-   - scopes/shareddb-prod/inbound/from-payments.yaml
+   - scopes/app-payments_env-prod/cross-scope/to-shareddb.yaml
+   - scopes/app-shareddb_env-prod/inbound/from-payments.yaml
 
 2. Team A opens a PR against main
 
@@ -1148,6 +1197,7 @@ The plugin is configured through environment variables, set when installing via 
 | `SCAN_INTERVAL` | int | no | `3600` | Seconds between sync cycles |
 | `AUTO_PROVISION` | bool | no | `false` | Auto-provision draft to active after Git-to-PCE sync |
 | `DRIFT_ALERT` | bool | no | `true` | Enable drift detection alerts |
+| `EXPORT_AS_PR` | bool | no | `false` | When true, export writes to a new branch and opens a PR instead of committing directly to the main branch. Recommended for enforcing review on all policy changes including PCE GUI edits. |
 | `DATA_DIR` | string | no | `/data` | Persistent storage directory for Git clone and state |
 | `HTTP_PORT` | int | no | `8080` | Port for the dashboard HTTP server |
 
@@ -1271,94 +1321,92 @@ Drift items are displayed on the plugin dashboard under the "Drift Report" tab.
 
 ## Getting Started
 
-### Prerequisites
+This section walks you from a fresh clone of this repo to a fully working policy-as-code pipeline. You will end up with:
 
-- A running Illumio PCE with API credentials
-- A GitHub organization with teams configured
-- The `plugger` tool installed (for the plugin component)
-- Docker (for building the plugin container)
+- A **policy repository** (a new GitHub repo) holding your PCE policy as YAML
+- The **plugin** running and syncing your PCE policy into that repo
+- **GitHub Actions** validating every PR with security checks and traffic evidence
+- **Branch protection** enforcing team approvals via CODEOWNERS
+
+Total setup time: ~30 minutes.
+
+---
+
+### What You Need
+
+| Requirement | Notes |
+|---|---|
+| Illumio PCE | API key + secret, hostname, org ID |
+| GitHub organization | Teams must exist before CODEOWNERS can reference them |
+| GitHub Personal Access Token (PAT) | Needs `repo` scope — see Step 0 |
+| Docker | To build and run the plugin container |
+| `plugger` CLI (optional) | Recommended for production; Docker alone works for testing |
+
+---
+
+### Step 0: Create a GitHub Personal Access Token
+
+The plugin needs a PAT to clone the policy repo and push commits. The GitHub Actions workflows use a separate token (the built-in `GITHUB_TOKEN`) for posting PR comments — you do not need to manage that one.
+
+1. Go to **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**
+2. Click **Generate new token (classic)**
+3. Set an expiration (90 days recommended for testing; shorter for production with rotation)
+4. Select scope: **`repo`** (full repository access — needed for clone, push, and PR creation)
+5. Click **Generate token** and save it — you will not see it again
+
+This token is used in two places: as `GIT_TOKEN` for the plugin, and as a fallback if the workflow needs to write to the repo beyond `GITHUB_TOKEN`'s default permissions.
+
+---
 
 ### Step 1: Create the Policy Repository
 
-Create a new repository in your GitHub organization using the template files from `template/`:
+The policy repository is a new, dedicated GitHub repo that holds only YAML policy files. It is not this repo — it is the repo the plugin writes to and your teams open PRs against.
 
 ```bash
-# Create the repo
-gh repo create org/illumio-policy --private
-
-# Clone it
-git clone git@github.com:org/illumio-policy.git
+# Create a new private repo in your GitHub org
+gh repo create YOUR_ORG/illumio-policy --private --clone
 cd illumio-policy
 
-# Copy the template files
-cp -r /path/to/policy-gitops/template/* .
-cp -r /path/to/policy-gitops/template/.github .
-cp -r /path/to/policy-gitops/template/.illumio .
+# Copy all template files (including hidden directories)
+GITOPS_DIR=/path/to/illumio-policy-gitops
+cp -r "$GITOPS_DIR/template/." .
 
-# Copy the action scripts
+# Copy the action scripts the workflows depend on
 mkdir -p .github/scripts
-cp /path/to/policy-gitops/action/scripts/*.py .github/scripts/
+cp "$GITOPS_DIR/action/scripts/"*.py .github/scripts/
 
 # Initial commit
 git add -A
-git commit -m "Initial policy repository from template"
-git push
+git commit -m "Initialize policy repository from template"
+git push -u origin main
 ```
 
-### Step 2: Configure CODEOWNERS
-
-Edit `CODEOWNERS` to match your organization's team structure:
-
+Verify the repo now contains:
 ```
-# Global policy
-scopes/_global/         @your-org/security-team
-ip-lists/               @your-org/security-team
-services/               @your-org/security-team
-.illumio/               @your-org/security-team
-
-# Per-scope ownership
-scopes/payments-prod/   @your-org/payments-team
-scopes/shareddb-prod/   @your-org/database-team
-scopes/ordering-prod/   @your-org/ordering-team
-
-# Cross-scope rules
-scopes/*/cross-scope/   @your-org/security-team
-scopes/*/inbound/       @your-org/security-team
+.github/workflows/validate-policy.yml
+.github/workflows/provision-policy.yml
+.github/scripts/security-check.py
+.github/scripts/traffic-evidence.py
+.illumio/config.yaml
+.illumio/security-rules.yaml
+CODEOWNERS
+scopes/_global/
 ```
 
-### Step 3: Set Up GitHub Secrets
+---
 
-In the repository settings, add the following secrets:
+### Step 2: Configure `.illumio/config.yaml`
 
-| Secret | Value |
-|--------|-------|
-| `PCE_HOST` | `https://pce.example.com` |
-| `PCE_PORT` | `8443` |
-| `PCE_ORG_ID` | `1` |
-| `PCE_API_KEY` | Your API key username |
-| `PCE_API_SECRET` | Your API key secret |
-
-### Step 4: Enable Branch Protection
-
-In the repository settings under Branches, add a branch protection rule for `main`:
-
-- Require pull request reviews before merging
-- Require review from Code Owners
-- Require status checks to pass before merging (select "Policy Validation")
-- Do not allow bypassing the above settings
-
-### Step 5: Configure the Policy Repository
-
-Edit `.illumio/config.yaml` with your PCE connection details:
+Edit `.illumio/config.yaml` in the policy repo with your PCE connection details:
 
 ```yaml
 pce:
-  host: pce.example.com
+  host: pce.example.com   # hostname only, no https://
   port: 8443
   org_id: 1
 
 policy:
-  provision_mode: draft        # Start with draft, switch to active when confident
+  provision_mode: draft        # Start with draft; switch to active when confident
   provision_on_merge: true
 
 security:
@@ -1370,62 +1418,181 @@ traffic:
   min_connections: 10
 ```
 
-Edit `.illumio/security-rules.yaml` to add any exemptions for your environment.
+Commit and push this change before proceeding.
 
-### Step 6: Build and Run the Plugin (Initial Export)
+---
+
+### Step 3: Add GitHub Actions Secrets
+
+In the **policy repository** (not this repo): **Settings → Secrets and variables → Actions → New repository secret**
+
+| Secret name | Value |
+|---|---|
+| `PCE_HOST` | `https://pce.example.com` (with protocol) |
+| `PCE_PORT` | `8443` |
+| `PCE_ORG_ID` | `1` |
+| `PCE_API_KEY` | Your API key username |
+| `PCE_API_SECRET` | Your API key secret |
+
+These secrets are used by `validate-policy.yml` (traffic evidence) and `provision-policy.yml` (provisioning on merge).
+
+---
+
+### Step 4: Enable Branch Protection
+
+In the policy repository: **Settings → Branches → Add rule** for the `main` branch:
+
+- [x] Require a pull request before merging
+- [x] Require approvals (1 minimum)
+- [x] Require review from Code Owners
+- [x] Require status checks to pass → add **"Policy Validation"**
+- [x] Do not allow bypassing the above settings
+
+This ensures no policy change reaches `main` without both a passing CI check and the required team approvals.
+
+---
+
+### Step 5: Run the Plugin — Initial Export
+
+The plugin connects to your PCE, reads all rulesets, IP lists, and services, and writes them as YAML files into the policy repo. Run it once in `export` mode to bootstrap the repository.
+
+#### Option A: Docker (fastest for testing)
 
 ```bash
-# Build the plugin container
-cd /path/to/policy-gitops
+# Build the container from this repo
+cd /path/to/illumio-policy-gitops/plugin
 docker build -t policy-gitops:latest .
 
-# Install via plugger
-plugger install plugin.yaml
-
-# Configure environment variables
-plugger config set policy-gitops GIT_REPO_URL "https://github.com/org/illumio-policy.git"
-plugger config set policy-gitops GIT_TOKEN "ghp_your_token_here"
-plugger config set policy-gitops SYNC_MODE "export"
-
-# Start the plugin
-plugger start policy-gitops
+docker run -d \
+  --name policy-gitops \
+  -e PCE_HOST="https://pce.example.com" \
+  -e PCE_PORT="8443" \
+  -e PCE_ORG_ID="1" \
+  -e PCE_API_KEY="your-api-key" \
+  -e PCE_API_SECRET="your-api-secret" \
+  -e GIT_REPO_URL="https://github.com/YOUR_ORG/illumio-policy.git" \
+  -e GIT_TOKEN="ghp_your_token_here" \
+  -e SYNC_MODE="export" \
+  -e SCAN_INTERVAL="60" \
+  -p 8080:8080 \
+  policy-gitops:latest
 
 # Watch the initial export
+docker logs -f policy-gitops
+```
+
+#### Option B: Plugger
+
+```bash
+cd /path/to/illumio-policy-gitops/plugin
+docker build -t policy-gitops:latest .
+plugger install plugin.yaml
+
+plugger config set policy-gitops PCE_HOST      "https://pce.example.com"
+plugger config set policy-gitops PCE_PORT      "8443"
+plugger config set policy-gitops PCE_ORG_ID    "1"
+plugger config set policy-gitops PCE_API_KEY   "your-api-key"
+plugger config set policy-gitops PCE_API_SECRET "your-api-secret"
+plugger config set policy-gitops GIT_REPO_URL  "https://github.com/YOUR_ORG/illumio-policy.git"
+plugger config set policy-gitops GIT_TOKEN     "ghp_your_token_here"
+plugger config set policy-gitops SYNC_MODE     "export"
+plugger config set policy-gitops SCAN_INTERVAL "60"
+
+plugger start policy-gitops
 plugger logs policy-gitops -f
 ```
 
-The plugin will:
-1. Clone the policy repository
-2. Connect to the PCE and cache all labels, services, and IP lists
-3. Export all rulesets as YAML files organized by scope
-4. Auto-generate `_scope.yaml` files for each scope directory
-5. Auto-generate `CODEOWNERS`
-6. Commit and push to the repository
+#### Verify the export worked
 
-### Step 7: First PR Workflow
+```bash
+# Dashboard should show status and last_export timestamp
+curl http://localhost:8080/api/state | python3 -m json.tool
 
-After the initial export, create a test branch and make a small change:
+# Check the policy repo on GitHub — scopes/ directories should have appeared
+cd illumio-policy && git pull && ls scopes/
+# Expected: _global/  app-payments_env-prod/  app-shareddb_env-prod/  ...
+```
+
+The export is complete when you see directories under `scopes/` in the policy repo and the plugin logs show `Export complete`.
+
+---
+
+### Step 6: Update CODEOWNERS
+
+After the initial export, the plugin auto-generates a `CODEOWNERS` file based on the directories it created. Review it and assign your actual GitHub teams.
+
+The generated file will have placeholder entries like:
+
+```
+scopes/app-payments_env-prod/   # TODO: assign team
+```
+
+Edit it to assign real teams:
+
+```
+# Global policy -- security team reviews all infrastructure changes
+scopes/_global/                  @your-org/security-team
+ip-lists/                        @your-org/security-team
+services/                        @your-org/security-team
+.illumio/                        @your-org/security-team
+
+# Per-scope ownership -- directory name encodes the label key=value pairs
+scopes/app-payments_env-prod/    @your-org/payments-team
+scopes/app-shareddb_env-prod/    @your-org/database-team
+scopes/app-ordering_env-prod/    @your-org/ordering-team
+
+# Cross-scope rules always require security team review
+scopes/*/cross-scope/            @your-org/security-team
+scopes/*/inbound/                @your-org/security-team
+```
+
+Commit and push this change directly to `main` (before branch protection locks it down, or via admin bypass).
+
+---
+
+### Step 7: Test the PR Workflow
+
+Create a test branch and open a PR to verify the full pipeline works end-to-end:
 
 ```bash
 cd illumio-policy
-git checkout -b test/add-rule
+git pull
+git checkout -b test/validate-pipeline
 
-# Edit a ruleset file
-vim scopes/payments-prod/intra-rules.yaml
-# Add a new rule
+# Make a trivial change to any ruleset -- add a description field, change nothing structural
+# Example: pick any file the export created
+SCOPE_FILE=$(find scopes -name "*.yaml" ! -name "_scope.yaml" | head -1)
+echo "  # test" >> "$SCOPE_FILE"
 
-git add .
-git commit -m "Add web-to-cache rule for payments-prod"
-git push -u origin test/add-rule
+git add "$SCOPE_FILE"
+git commit -m "test: trigger validation pipeline"
+git push -u origin test/validate-pipeline
 
-# Open a PR
-gh pr create --title "Add web-to-cache rule" --body "Testing the policy-gitops pipeline"
+gh pr create --title "Test: validate pipeline" \
+  --body "Smoke test to verify security check, traffic evidence, and PR comment all work."
 ```
 
-Watch the GitHub Actions workflow run. Within a few minutes, you should see:
-- A PR comment with the security analysis and traffic evidence
-- CODEOWNERS-required reviews from the appropriate teams
-- A green or red status check from the validation pipeline
+Within 2-3 minutes you should see on the PR:
+- A comment from the workflow with the security analysis table and traffic evidence section
+- A **Policy Validation** status check (green if no critical findings, red if SEC-001–SEC-008 fired)
+- CODEOWNERS review requests sent to the appropriate teams
+
+If the check is green, close the PR without merging. The pipeline is working.
+
+---
+
+### Step 8: Switch to Ongoing Sync
+
+Once the initial export is done and the PR workflow is verified, switch the plugin to the mode that fits your workflow:
+
+| Goal | `SYNC_MODE` | `EXPORT_AS_PR` | Notes |
+|---|---|---|---|
+| Track PCE, no review gate on GUI changes | `export` | `false` | Default; exports commit directly to main |
+| Track PCE, enforce review on all changes | `export` | `true` | **Recommended** — exports open a PR; validate pipeline runs; team approves before merge |
+| Apply Git changes to PCE (Git is source of truth) | `provision` | n/a | Provisions on merge via GitHub Actions; plugin syncs the rest |
+| Transition period (both directions) | `bidirectional` | — | Use temporarily; avoid long-term to prevent sync loops |
+
+For most teams: use `SYNC_MODE=export` with `EXPORT_AS_PR=true`. Every PCE change — whether made through the GUI or via API — surfaces as a PR and goes through the same review and validation pipeline before landing on `main`.
 
 ---
 

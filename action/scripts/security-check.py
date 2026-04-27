@@ -24,6 +24,7 @@ DEFAULT_RULES = [
         "name": "No any-to-any rules",
         "severity": "critical",
         "action": "block",
+        "scope_filter": "unscoped",
         "description": "Rules with 'all workloads' on both providers and consumers defeat micro-segmentation.",
     },
     {
@@ -62,7 +63,7 @@ DEFAULT_RULES = [
         "severity": "high",
         "action": "warn",
         "ports": [5432, 3306, 1433, 1521, 27017],
-        "description": "Database ports should be scoped to specific consumer roles.",
+        "description": "Database ports should only be accessible from specific consumer roles.",
     },
     {
         "id": "SEC-007",
@@ -77,20 +78,52 @@ DEFAULT_RULES = [
 def load_security_rules():
     """Load security rules from .illumio/security-rules.yaml or use defaults."""
     rules_path = os.path.join(os.getcwd(), ".illumio", "security-rules.yaml")
-    if os.path.exists(rules_path):
-        with open(rules_path) as f:
-            config = yaml.safe_load(f)
-            return config.get("rules", DEFAULT_RULES), config.get("exemptions", [])
-    return DEFAULT_RULES, []
+    if not os.path.exists(rules_path):
+        return DEFAULT_RULES, []
+
+    with open(rules_path) as f:
+        config = yaml.safe_load(f) or {}
+
+    # Merge: start with defaults, override/extend with config file entries
+    config_rules = config.get("rules", [])
+    if not config_rules:
+        merged = DEFAULT_RULES
+    else:
+        default_by_id = {r["id"]: dict(r) for r in DEFAULT_RULES}
+        for cr in config_rules:
+            rid = cr.get("id", "")
+            if rid in default_by_id:
+                default_by_id[rid].update(cr)
+            else:
+                default_by_id[rid] = cr
+        merged = list(default_by_id.values())
+
+    # Filter out disabled rules
+    active = [r for r in merged if r.get("enabled", True)]
+    return active, config.get("exemptions", [])
 
 
-def check_rule_any_to_any(rule_data):
-    """SEC-001: Check for any-to-any rules."""
+def _ruleset_is_scoped(data: dict) -> bool:
+    """Return True if the ruleset has a non-empty scope (i.e. it is not global)."""
+    for scope_entry in data.get("scopes", []):
+        if scope_entry:
+            return True
+    return False
+
+
+def check_rule_any_to_any(rule_data: dict, is_scoped: bool) -> bool:
+    """SEC-001: Check for any-to-any rules.
+
+    ams→ams in a scoped ruleset is intra-scope ringfencing (valid pattern).
+    ams→ams in a global/unscoped ruleset is true any-to-any (dangerous).
+    """
     providers = rule_data.get("providers", [])
     consumers = rule_data.get("consumers", [])
     prov_ams = any(p.get("actors") == "ams" for p in providers if isinstance(p, dict))
     cons_ams = any(c.get("actors") == "ams" for c in consumers if isinstance(c, dict))
-    return prov_ams and cons_ams
+    if not (prov_ams and cons_ams):
+        return False
+    return not is_scoped
 
 
 def check_broad_port_range(services):
@@ -127,6 +160,35 @@ def check_broad_cidr(ip_ranges):
     return None
 
 
+def _is_rule_applicable(rule_cfg: dict, is_scoped: bool) -> bool:
+    """Check scope_filter to decide if a rule applies to this ruleset."""
+    scope_filter = rule_cfg.get("scope_filter", "")
+    if scope_filter == "unscoped":
+        return not is_scoped
+    if scope_filter == "scoped":
+        return is_scoped
+    return True
+
+
+def _is_scope_exempt(data: dict, exemptions: list, rule_id: str) -> bool:
+    """Check scope-pattern exemptions (env=dev style)."""
+    for ex in exemptions:
+        pattern = ex.get("scope_pattern", "")
+        if not pattern:
+            continue
+        # Match against scope label values in the YAML
+        for scope_entry in data.get("scopes", []):
+            for item in scope_entry:
+                if isinstance(item, dict) and "label" in item:
+                    lbl = item["label"]
+                    if isinstance(lbl, dict):
+                        for k, v in lbl.items():
+                            if f"{k}={v}" == pattern or str(v) == pattern:
+                                if rule_id in ex.get("exempt_rules", []):
+                                    return True
+    return False
+
+
 def analyze_file(filepath, rules, exemptions):
     """Analyze a single YAML policy file against security rules."""
     findings = []
@@ -147,15 +209,20 @@ def analyze_file(filepath, rules, exemptions):
     if not isinstance(data, dict):
         return findings
 
-    # Check exemptions
+    is_scoped = _ruleset_is_scoped(data)
+
+    # Build per-file exempt set from ruleset_pattern and scope_pattern exemptions
     ruleset_name = data.get("name", "")
     exempt_rules = set()
     for ex in exemptions:
-        pattern = ex.get("ruleset_pattern", "")
-        if pattern and pattern in ruleset_name:
+        rp = ex.get("ruleset_pattern", "")
+        if rp and rp in ruleset_name:
             exempt_rules.update(ex.get("exempt_rules", []))
+        # Scope-pattern exemptions are checked per-rule below via _is_scope_exempt
 
-    # Check rules within rulesets
+    # Build a lookup of active rules by id for quick access to config
+    rule_cfg_by_id = {r["id"]: r for r in rules}
+
     for rule_data in data.get("rules", []):
         if not isinstance(rule_data, dict):
             continue
@@ -163,89 +230,117 @@ def analyze_file(filepath, rules, exemptions):
         rule_name = rule_data.get("name", "(unnamed)")
         services = rule_data.get("services", [])
 
-        # SEC-001: any-to-any
-        if "SEC-001" not in exempt_rules and check_rule_any_to_any(rule_data):
-            findings.append({
-                "file": filepath,
-                "rule_id": "SEC-001",
-                "severity": "critical",
-                "action": "block",
-                "message": f"Rule '{rule_name}' allows any-to-any traffic",
-                "context": f"providers and consumers both use 'actors: ams'",
-            })
+        # SEC-001: any-to-any (only on unscoped rulesets by default)
+        if "SEC-001" not in exempt_rules and "SEC-001" in rule_cfg_by_id:
+            cfg = rule_cfg_by_id["SEC-001"]
+            if (_is_rule_applicable(cfg, is_scoped)
+                    and not _is_scope_exempt(data, exemptions, "SEC-001")
+                    and check_rule_any_to_any(rule_data, is_scoped)):
+                findings.append({
+                    "file": filepath,
+                    "rule_id": "SEC-001",
+                    "severity": cfg.get("severity", "critical"),
+                    "action": cfg.get("action", "block"),
+                    "message": f"Rule '{rule_name}' allows any-to-any traffic (unscoped ruleset)",
+                    "context": "providers and consumers both use 'actors: ams' with no scope restriction",
+                })
 
         # SEC-002: broad port range
-        if "SEC-002" not in exempt_rules and check_broad_port_range(services):
-            findings.append({
-                "file": filepath,
-                "rule_id": "SEC-002",
-                "severity": "critical",
-                "action": "block",
-                "message": f"Rule '{rule_name}' has a port range exceeding 1000 ports",
-            })
+        if "SEC-002" not in exempt_rules and "SEC-002" in rule_cfg_by_id:
+            cfg = rule_cfg_by_id["SEC-002"]
+            if (_is_rule_applicable(cfg, is_scoped)
+                    and not _is_scope_exempt(data, exemptions, "SEC-002")
+                    and check_broad_port_range(services)):
+                findings.append({
+                    "file": filepath,
+                    "rule_id": "SEC-002",
+                    "severity": cfg.get("severity", "critical"),
+                    "action": cfg.get("action", "block"),
+                    "message": f"Rule '{rule_name}' has a port range exceeding 1000 ports",
+                })
 
         # SEC-003: insecure protocols
-        if "SEC-003" not in exempt_rules:
-            insecure = check_ports(services, [21, 23, 69, 513, 514])
-            if insecure:
-                findings.append({
-                    "file": filepath,
-                    "rule_id": "SEC-003",
-                    "severity": "critical",
-                    "action": "block",
-                    "message": f"Rule '{rule_name}' allows insecure ports: {insecure}",
-                })
-
-        # SEC-005: RDP/SMB
-        if "SEC-005" not in exempt_rules:
-            risky = check_ports(services, [3389, 445])
-            if risky:
-                findings.append({
-                    "file": filepath,
-                    "rule_id": "SEC-005",
-                    "severity": "high",
-                    "action": "warn",
-                    "message": f"Rule '{rule_name}' allows RDP/SMB ports: {risky}",
-                })
-
-        # SEC-006: DB ports without specific consumer
-        if "SEC-006" not in exempt_rules:
-            db_ports = check_ports(services, [5432, 3306, 1433, 1521, 27017])
-            if db_ports:
-                consumers = rule_data.get("consumers", [])
-                has_specific = any(c.get("label", {}).get("role") for c in consumers if isinstance(c, dict))
-                if not has_specific:
+        if "SEC-003" not in exempt_rules and "SEC-003" in rule_cfg_by_id:
+            cfg = rule_cfg_by_id["SEC-003"]
+            ports = cfg.get("ports", [21, 23, 69, 513, 514])
+            if (_is_rule_applicable(cfg, is_scoped)
+                    and not _is_scope_exempt(data, exemptions, "SEC-003")):
+                insecure = check_ports(services, ports)
+                if insecure:
                     findings.append({
                         "file": filepath,
-                        "rule_id": "SEC-006",
-                        "severity": "high",
-                        "action": "warn",
-                        "message": f"Rule '{rule_name}' exposes DB ports {db_ports} without role-specific consumers",
+                        "rule_id": "SEC-003",
+                        "severity": cfg.get("severity", "critical"),
+                        "action": cfg.get("action", "block"),
+                        "message": f"Rule '{rule_name}' allows insecure ports: {insecure}",
                     })
 
+        # SEC-005: RDP/SMB
+        if "SEC-005" not in exempt_rules and "SEC-005" in rule_cfg_by_id:
+            cfg = rule_cfg_by_id["SEC-005"]
+            ports = cfg.get("ports", [3389, 445])
+            if (_is_rule_applicable(cfg, is_scoped)
+                    and not _is_scope_exempt(data, exemptions, "SEC-005")):
+                risky = check_ports(services, ports)
+                if risky:
+                    findings.append({
+                        "file": filepath,
+                        "rule_id": "SEC-005",
+                        "severity": cfg.get("severity", "high"),
+                        "action": cfg.get("action", "warn"),
+                        "message": f"Rule '{rule_name}' allows RDP/SMB ports: {risky}",
+                    })
+
+        # SEC-006: DB ports without specific consumer
+        if "SEC-006" not in exempt_rules and "SEC-006" in rule_cfg_by_id:
+            cfg = rule_cfg_by_id["SEC-006"]
+            ports = cfg.get("ports", [5432, 3306, 1433, 1521, 27017])
+            if (_is_rule_applicable(cfg, is_scoped)
+                    and not _is_scope_exempt(data, exemptions, "SEC-006")):
+                db_ports = check_ports(services, ports)
+                if db_ports:
+                    consumers = rule_data.get("consumers", [])
+                    has_specific = any(
+                        c.get("label", {}).get("role")
+                        for c in consumers if isinstance(c, dict)
+                    )
+                    if not has_specific:
+                        findings.append({
+                            "file": filepath,
+                            "rule_id": "SEC-006",
+                            "severity": cfg.get("severity", "high"),
+                            "action": cfg.get("action", "warn"),
+                            "message": f"Rule '{rule_name}' exposes DB ports {db_ports} without role-specific consumers",
+                        })
+
     # SEC-004: cross-scope without justification
-    if "SEC-004" not in exempt_rules:
-        if data.get("type") == "extra-scope" or data.get("unscoped_consumers"):
-            if not data.get("justification"):
-                findings.append({
-                    "file": filepath,
-                    "rule_id": "SEC-004",
-                    "severity": "high",
-                    "action": "warn",
-                    "message": "Cross-scope rule missing 'justification' field",
-                })
+    if "SEC-004" not in exempt_rules and "SEC-004" in rule_cfg_by_id:
+        cfg = rule_cfg_by_id["SEC-004"]
+        if (_is_rule_applicable(cfg, is_scoped)
+                and not _is_scope_exempt(data, exemptions, "SEC-004")):
+            if data.get("type") == "extra-scope" or data.get("unscoped_consumers"):
+                if not data.get("justification"):
+                    findings.append({
+                        "file": filepath,
+                        "rule_id": "SEC-004",
+                        "severity": cfg.get("severity", "high"),
+                        "action": cfg.get("action", "warn"),
+                        "message": "Cross-scope rule missing 'justification' field",
+                    })
 
     # SEC-007: IP list broad CIDR
-    if "SEC-007" not in exempt_rules and "ip-lists" in filepath:
-        broad = check_broad_cidr(data.get("ip_ranges", []))
-        if broad:
-            findings.append({
-                "file": filepath,
-                "rule_id": "SEC-007",
-                "severity": "medium",
-                "action": "warn",
-                "message": f"IP list contains very broad CIDR: {broad}",
-            })
+    if "SEC-007" not in exempt_rules and "SEC-007" in rule_cfg_by_id and "ip-lists" in filepath:
+        cfg = rule_cfg_by_id["SEC-007"]
+        if not _is_scope_exempt(data, exemptions, "SEC-007"):
+            broad = check_broad_cidr(data.get("ip_ranges", []))
+            if broad:
+                findings.append({
+                    "file": filepath,
+                    "rule_id": "SEC-007",
+                    "severity": cfg.get("severity", "medium"),
+                    "action": cfg.get("action", "warn"),
+                    "message": f"IP list contains very broad CIDR: {broad}",
+                })
 
     return findings
 
@@ -280,10 +375,10 @@ def main():
           f"({summary['critical']}C {summary['high']}H {summary['medium']}M)")
 
     if summary["blocked"]:
-        print("❌ BLOCKED: Critical security findings found")
+        print("BLOCKED: Critical security findings found")
         sys.exit(1)
     else:
-        print("✅ PASSED: No blocking findings")
+        print("PASSED: No blocking findings")
 
 
 if __name__ == "__main__":

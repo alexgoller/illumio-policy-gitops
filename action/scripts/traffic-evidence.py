@@ -6,6 +6,8 @@ For each new/changed rule in a PR, queries the PCE for blocked traffic
 that matches the rule's consumer/provider/service pattern. This provides
 evidence that a rule is justified by actual traffic.
 
+Config is read from .illumio/traffic-evidence.yaml when present.
+
 Usage:
   python3 traffic-evidence.py --changed-files "scopes/foo/bar.yaml" \
     --lookback-days 30 --output traffic-report.json
@@ -25,6 +27,59 @@ try:
     HAS_ILLUMIO = True
 except ImportError:
     HAS_ILLUMIO = False
+
+
+def load_traffic_config(cli_lookback_days: int) -> dict:
+    """Load traffic evidence config from .illumio/traffic-evidence.yaml.
+
+    CLI args take precedence over config file defaults.
+    """
+    defaults = {
+        "enabled": True,
+        "lookback_days": cli_lookback_days,
+        "min_connections": 1,
+        "scope_overrides": {},
+        "thresholds": {
+            "justified": 10,
+            "weak_evidence": 1,
+        },
+        "query": {
+            "policy_decisions": ["blocked", "potentially_blocked"],
+            "exclude_ports": [],
+        },
+    }
+
+    config_path = os.path.join(os.getcwd(), ".illumio", "traffic-evidence.yaml")
+    if not os.path.exists(config_path):
+        return defaults
+
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f) or {}
+
+    # Merge top-level keys; CLI lookback_days overrides file if explicitly passed
+    merged = {**defaults, **cfg}
+    if cli_lookback_days != 30:  # non-default CLI value wins
+        merged["lookback_days"] = cli_lookback_days
+    # Nested merge for thresholds and query
+    merged["thresholds"] = {**defaults["thresholds"], **cfg.get("thresholds", {})}
+    merged["query"] = {**defaults["query"], **cfg.get("query", {})}
+    return merged
+
+
+def get_scope_config(config: dict, scope_labels: dict) -> dict:
+    """Return per-scope override config merged with global config."""
+    overrides = config.get("scope_overrides", {})
+    merged = {
+        "enabled": config.get("enabled", True),
+        "lookback_days": config.get("lookback_days", 30),
+        "min_connections": config.get("min_connections", 1),
+    }
+    for pattern, override in overrides.items():
+        for k, v in scope_labels.items():
+            if f"{k}={v}" == pattern or str(v) == pattern:
+                merged.update(override)
+                break
+    return merged
 
 
 def get_pce():
@@ -48,19 +103,26 @@ def get_pce():
 
 
 def extract_rules_from_file(filepath):
-    """Extract rules from a YAML policy file."""
+    """Extract rules and scope labels from a YAML policy file."""
     try:
         with open(filepath) as f:
             data = yaml.safe_load(f)
     except Exception:
-        return []
+        return [], {}
 
     if not isinstance(data, dict):
-        return []
+        return [], {}
+
+    # Collect scope label values for per-scope config lookup
+    scope_labels = {}
+    for scope_entry in data.get("scopes", []):
+        for item in scope_entry:
+            if isinstance(item, dict) and "label" in item:
+                lbl = item["label"]
+                if isinstance(lbl, dict):
+                    scope_labels.update(lbl)
 
     rules = []
-
-    # Standard ruleset with rules array
     for rule in data.get("rules", []):
         if isinstance(rule, dict):
             rules.append({
@@ -69,6 +131,7 @@ def extract_rules_from_file(filepath):
                 "consumers": rule.get("consumers", []),
                 "providers": rule.get("providers", []),
                 "services": rule.get("services", []),
+                "scope_labels": scope_labels,
             })
 
     # Cross-scope rule format
@@ -82,37 +145,42 @@ def extract_rules_from_file(filepath):
             "consumers": consumers,
             "providers": providers,
             "services": services,
+            "scope_labels": scope_labels,
         })
 
-    return rules
+    return rules, scope_labels
 
 
-def query_traffic_for_rule(pce, rule, lookback_days):
+def _make_verdict(total_connections: int, thresholds: dict, lookback_days: int,
+                  unique_sources: int) -> str:
+    justified_threshold = thresholds.get("justified", 10)
+    weak_threshold = thresholds.get("weak_evidence", 1)
+    if total_connections >= justified_threshold:
+        return f"JUSTIFIED — {total_connections:,} blocked connections over {lookback_days} days from {unique_sources} sources"
+    elif total_connections >= weak_threshold:
+        return f"WEAK EVIDENCE — only {total_connections} blocked connection(s) in {lookback_days} days"
+    return f"NO EVIDENCE — 0 blocked connections in {lookback_days} days"
+
+
+def query_traffic_for_rule(pce, rule: dict, scope_cfg: dict, global_config: dict) -> dict:
     """Query PCE for blocked traffic matching a rule's pattern."""
     if not pce:
         return None
 
-    # Extract consumer/provider labels for description
-    consumer_labels = {}
-    for c in rule.get("consumers", []):
-        if isinstance(c, dict) and "label" in c:
-            lbl = c["label"]
-            if isinstance(lbl, dict):
-                consumer_labels.update(lbl)
-
-    provider_labels = {}
-    for p in rule.get("providers", []):
-        if isinstance(p, dict) and "label" in p:
-            lbl = p["label"]
-            if isinstance(lbl, dict):
-                provider_labels.update(lbl)
+    lookback_days = scope_cfg.get("lookback_days", 30)
+    min_connections = scope_cfg.get("min_connections", 1)
+    exclude_ports = set(global_config.get("query", {}).get("exclude_ports", []))
+    policy_decisions = global_config.get("query", {}).get(
+        "policy_decisions", ["blocked", "potentially_blocked"]
+    )
+    thresholds = global_config.get("thresholds", {})
 
     # Extract ports
     ports = []
     for svc in rule.get("services", []):
         if isinstance(svc, dict):
             port = svc.get("port")
-            if port:
+            if port and port not in exclude_ports:
                 ports.append(port)
 
     if not ports:
@@ -125,13 +193,12 @@ def query_traffic_for_rule(pce, rule, lookback_days):
         tq = TrafficQuery.build(
             start_date=start.strftime("%Y-%m-%dT%H:%M:%SZ"),
             end_date=end.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            policy_decisions=["blocked", "potentially_blocked"],
+            policy_decisions=policy_decisions,
             max_results=10000,
         )
 
         flows = pce.get_traffic_flows_async("policy-gitops-evidence", tq)
 
-        # Filter flows matching this rule's pattern
         matching_flows = []
         total_connections = 0
 
@@ -146,13 +213,10 @@ def query_traffic_for_rule(pce, rule, lookback_days):
             if flow_port not in ports:
                 continue
 
-            # Check if src/dst labels match consumer/provider labels
             src = flow.get("src", {})
             dst = flow.get("dst", {})
             num = flow.get("num_connections", 1)
 
-            # Simple match: if we have label constraints, check them
-            # For now, just match by port (label matching requires label cache)
             total_connections += num
             src_name = src.get("workload", {}).get("hostname", src.get("ip", "?"))
             dst_name = dst.get("workload", {}).get("hostname", dst.get("ip", "?"))
@@ -165,14 +229,17 @@ def query_traffic_for_rule(pce, rule, lookback_days):
                 "decision": flow.get("policy_decision", "unknown"),
             })
 
-        if not matching_flows:
+        if total_connections < min_connections:
             return {
                 "traffic_found": False,
-                "blocked_connections": 0,
-                "reason": f"No blocked traffic found on ports {ports} in last {lookback_days} days",
+                "blocked_connections": total_connections,
+                "reason": (
+                    f"No blocked traffic found on ports {ports} in last {lookback_days} days"
+                    if total_connections == 0
+                    else f"Only {total_connections} connection(s) — below min_connections threshold ({min_connections})"
+                ),
             }
 
-        # Aggregate
         matching_flows.sort(key=lambda x: -x["connections"])
         unique_sources = len(set(f["src"] for f in matching_flows))
         unique_dests = len(set(f["dst"] for f in matching_flows))
@@ -183,7 +250,7 @@ def query_traffic_for_rule(pce, rule, lookback_days):
             "unique_sources": unique_sources,
             "unique_destinations": unique_dests,
             "sample_flows": matching_flows[:10],
-            "verdict": f"JUSTIFIED — {total_connections:,} blocked connections over {lookback_days} days from {unique_sources} sources",
+            "verdict": _make_verdict(total_connections, thresholds, lookback_days, unique_sources),
         }
 
     except Exception as e:
@@ -197,9 +264,19 @@ def main():
     parser.add_argument("--output", default="traffic-report.json")
     args = parser.parse_args()
 
+    config = load_traffic_config(args.lookback_days)
+
+    if not config.get("enabled", True):
+        print("Traffic evidence disabled via config — skipping")
+        report = {"evidence": [], "summary": {"total_rules": 0, "justified": 0, "unjustified": 0},
+                  "lookback_days": config["lookback_days"], "skipped": True}
+        with open(args.output, "w") as f:
+            json.dump(report, f, indent=2)
+        return
+
     pce = get_pce()
     if not pce:
-        print("⚠️ PCE not configured — skipping traffic evidence")
+        print("PCE not configured — skipping traffic evidence")
 
     files = [f.strip() for f in args.changed_files.split("\n") if f.strip() and f.endswith((".yaml", ".yml"))]
 
@@ -207,9 +284,14 @@ def main():
     for filepath in files:
         if not os.path.exists(filepath):
             continue
-        rules = extract_rules_from_file(filepath)
+        rules, scope_labels = extract_rules_from_file(filepath)
+        scope_cfg = get_scope_config(config, scope_labels)
+
+        if not scope_cfg.get("enabled", True):
+            continue
+
         for rule in rules:
-            result = query_traffic_for_rule(pce, rule, args.lookback_days)
+            result = query_traffic_for_rule(pce, rule, scope_cfg, config)
             evidence.append({
                 "file": rule["file"],
                 "rule_name": rule["name"],
@@ -227,7 +309,7 @@ def main():
             "justified": justified,
             "unjustified": total - justified,
         },
-        "lookback_days": args.lookback_days,
+        "lookback_days": config["lookback_days"],
     }
 
     with open(args.output, "w") as f:

@@ -1,5 +1,21 @@
 # Security rules for policy validation pipeline
-# These rules are evaluated against every changed policy file in a PR
+# These rules are evaluated against every changed policy file in a PR.
+#
+# Fields per rule:
+#   id          — unique identifier (SEC-NNN or custom SEC-CUSTOM-NNN)
+#   name        — human-readable label shown in PR comments
+#   severity    — critical | high | medium
+#   action      — block (fails the PR) | warn (comment only)
+#   enabled     — set to false to disable without deleting the entry
+#   scope_filter — unscoped (only global rulesets) | scoped (only scoped rulesets) | omit for all
+#   ports       — list of port numbers this rule checks (for port-based rules)
+#   description — explanation shown in PR comments
+#
+# Exemptions:
+#   ruleset_pattern — substring match on ruleset name
+#   scope_pattern   — "key=value" match on ruleset scope labels (e.g. "env=dev")
+#   exempt_rules    — list of rule IDs to skip for matching rulesets
+#   reason          — human-readable justification
 
 rules:
   # CRITICAL — blocks the PR
@@ -7,7 +23,10 @@ rules:
     name: "No any-to-any rules"
     severity: critical
     action: block
-    description: "Rules with 'all workloads' on both sides defeat micro-segmentation"
+    scope_filter: unscoped   # ams→ams in a scoped ruleset is intra-scope ringfencing — OK
+    description: >
+      Rules with 'all workloads' on both providers and consumers in a global (unscoped)
+      ruleset defeat micro-segmentation. In a scoped ruleset this is valid ringfencing.
 
   - id: SEC-002
     name: "No broad port ranges"
@@ -57,8 +76,13 @@ rules:
     ports: [80]
     description: "Consider requiring HTTPS (443) instead of HTTP (80)"
 
-# Exemptions: bypass specific rules for specific rulesets
+# Exemptions: bypass specific rules for matching rulesets or scopes
 exemptions:
   - ruleset_pattern: "coreservices"
     exempt_rules: [SEC-005]
     reason: "Active Directory requires SMB for domain operations"
+
+  # Example: exempt dev environments from high-severity port warnings
+  # - scope_pattern: "env=dev"
+  #   exempt_rules: [SEC-005, SEC-006]
+  #   reason: "Dev environments have relaxed controls"

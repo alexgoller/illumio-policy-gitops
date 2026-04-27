@@ -47,7 +47,6 @@ SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL", "3600"))
 AUTO_PROVISION = os.environ.get("AUTO_PROVISION", "false").lower() in ("true", "1", "yes")
 DRIFT_ALERT = os.environ.get("DRIFT_ALERT", "true").lower() in ("true", "1", "yes")
 EXPORT_AS_PR = os.environ.get("EXPORT_AS_PR", "false").lower() in ("true", "1", "yes")
-EXPORT_POLICY_SCOPE = os.environ.get("EXPORT_POLICY_SCOPE", "active")  # active, draft, or both
 
 # Protocol number to name mapping (IANA)
 PROTO_NUM_TO_NAME = {6: "tcp", 17: "udp", 1: "icmp", 58: "icmpv6"}
@@ -78,6 +77,8 @@ app_state = {
     "last_export": None,
     "export_count": 0,
     "exported_objects": {},      # {rulesets: N, ip_lists: N, services: N}
+    "last_export_pr": None,      # PR URL when EXPORT_AS_PR=true
+    "last_reconcile": None,      # timestamp of last full reconcile
     # Drift tracking
     "drift_items": [],           # [{type, name, status, detail}]
     "last_drift_check": None,
@@ -178,7 +179,7 @@ class PolicySerializer:
     def refresh_service_cache(self):
         """Fetch all services from PCE and cache href -> service mapping."""
         try:
-            resp = self.pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
+            resp = self.pce.get("/sec_policy/active/services")
             if resp.status_code == 200:
                 for svc in resp.json():
                     href = svc.get("href", "")
@@ -191,7 +192,7 @@ class PolicySerializer:
     def refresh_ip_list_cache(self):
         """Fetch all IP lists from PCE and cache href -> ip_list mapping."""
         try:
-            resp = self.pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
+            resp = self.pce.get("/sec_policy/active/ip_lists")
             if resp.status_code == 200:
                 for ipl in resp.json():
                     href = ipl.get("href", "")
@@ -423,14 +424,67 @@ class PolicySerializer:
 
         return result
 
+    def _generate_rule_name(self, consumers: list, providers: list, services: list, unscoped: bool) -> str:
+        """Generate a human-readable rule name from resolved actors and services.
+
+        Format: {consumers} → {providers} : {services} [(extra-scope)]
+        Examples:
+          processing,cart → db : mysql (extra-scope)
+          All Workloads → All Workloads : All Services
+          web → db : postgresql, 5432/tcp
+        """
+        def actor_str(actor):
+            if not isinstance(actor, dict):
+                return "?"
+            if actor.get("actors") == "ams":
+                return "All Workloads"
+            if "label" in actor:
+                lbl = actor["label"]
+                if isinstance(lbl, dict):
+                    return ",".join(str(v) for v in lbl.values() if v)
+            if "ip_list" in actor:
+                return actor["ip_list"].get("name", "IP List")
+            if "label_group" in actor:
+                return "label-group"
+            if "workload" in actor:
+                return "workload"
+            return "?"
+
+        def svc_str(svc):
+            if not isinstance(svc, dict):
+                return "?"
+            if "name" in svc:
+                return svc["name"]
+            if "port" in svc:
+                proto = svc.get("proto", "tcp")
+                to_port = svc.get("to_port")
+                return f"{svc['port']}-{to_port}/{proto}" if to_port else f"{svc['port']}/{proto}"
+            return "?"
+
+        cons = ",".join(actor_str(a) for a in consumers) if consumers else "Any"
+        prov = ",".join(actor_str(a) for a in providers) if providers else "Any"
+        svcs = ", ".join(svc_str(s) for s in services) if services else "All Services"
+        suffix = " (extra-scope)" if unscoped else ""
+        return f"{cons} → {prov} : {svcs}{suffix}"
+
     def _export_rule_to_yaml(self, rule: dict) -> dict:
         """Convert a single PCE rule to YAML format."""
         consumers = [self._resolve_actor_to_yaml(a) for a in rule.get("consumers", [])]
         providers = [self._resolve_actor_to_yaml(a) for a in rule.get("providers", [])]
         services = [self._resolve_service_to_yaml(s) for s in rule.get("ingress_services", [])]
 
+        # Use description if present; generate a readable name from content otherwise.
+        # PCE hrefs ("/orgs/...") are never useful as names.
+        description = (rule.get("description") or "").strip()
+        if description and not description.startswith("/orgs/"):
+            rule_name = description
+        else:
+            rule_name = self._generate_rule_name(
+                consumers, providers, services, bool(rule.get("unscoped_consumers"))
+            )
+
         rule_yaml = {
-            "name": rule.get("description", "") or rule.get("href", "unnamed"),
+            "name": rule_name,
             "enabled": rule.get("enabled", True),
             "consumers": consumers,
             "providers": providers,
@@ -703,14 +757,14 @@ class ScopeMapper:
     def map_ruleset_to_directory(self, ruleset: dict) -> str:
         """Determine the directory path for a ruleset based on its scope labels.
 
-        Returns relative path under scopes/ (e.g. "scopes/payments-prod" or
-        "scopes/_global").
+        Returns relative path under scopes/ (e.g. "scopes/app-payments_env-prod"
+        or "scopes/_global").
 
         Strategy:
           - If scopes is empty or [[]], return "scopes/_global".
           - Otherwise resolve the first scope entry's labels.
-          - Build directory name from label values joined by hyphen
-            (e.g. app=payments + env=prod -> "payments-prod").
+          - Build directory name as key-value pairs joined by underscore
+            (e.g. app=payments + env=prod -> "app-payments_env-prod").
         """
         scopes = ruleset.get("scopes", [])
 
@@ -724,7 +778,7 @@ class ScopeMapper:
             return "scopes/_global"
 
         # Resolve labels in the scope
-        label_values = []
+        label_parts = []
         for item in first_scope:
             if not isinstance(item, dict):
                 continue
@@ -735,13 +789,17 @@ class ScopeMapper:
                 href = lbl.get("href", "") if isinstance(lbl, dict) else ""
                 resolved = self.serializer._label_cache.get(href, {})
                 if resolved:
-                    label_values.append(resolved["value"])
+                    key = _sanitize_filename(resolved.get("key", ""))
+                    value = _sanitize_filename(resolved.get("value", ""))
+                    if key and value:
+                        label_parts.append(f"{key}-{value}")
 
-        if not label_values:
+        if not label_parts:
             return "scopes/_global"
 
-        # Build directory name: join label values with hyphen
-        dir_name = _sanitize_filename("-".join(label_values))
+        # Build directory name: "key-value" pairs joined by underscore
+        # e.g. app=payments + env=prod -> "app-payments_env-prod"
+        dir_name = "_".join(label_parts)
         return f"scopes/{dir_name}"
 
     def resolve_scope_labels(self, scope_dir: str) -> list:
@@ -939,8 +997,29 @@ class GitClient:
             log.warning("Pull failed: %s", e)
             return False
 
-    def commit(self, message: str, files: list = None):
-        """Stage and commit changes.
+    def checkout(self, branch: str, create: bool = False):
+        """Switch to a branch, optionally creating it from current HEAD."""
+        if create:
+            self._run(["checkout", "-b", branch])
+        else:
+            self._run(["checkout", branch])
+        log.info("Checked out branch: %s", branch)
+
+    def fetch_and_checkout(self, branch: str):
+        """Fetch a remote branch and check it out locally.
+
+        Used when updating an existing export PR branch — the branch exists
+        on the remote but may not exist locally yet.
+        """
+        self._run(["fetch", "origin", branch], check=False)
+        result = self._run(["checkout", branch], check=False)
+        if result.returncode != 0:
+            # Local branch doesn't exist yet — create it tracking the remote
+            self._run(["checkout", "-b", branch, f"origin/{branch}"])
+        log.info("Fetched and checked out existing branch: %s", branch)
+
+    def commit(self, message: str, files: list = None) -> bool:
+        """Stage and commit changes. Returns True if a commit was made.
 
         Args:
             message: Commit message.
@@ -962,21 +1041,23 @@ class GitClient:
         status = self._run(["status", "--porcelain"], check=False)
         if not status.stdout.strip():
             log.info("No changes to commit")
-            return
+            return False
 
         self._run(["commit", "-m", message])
         log.info("Committed: %s", message)
+        return True
 
-    def push(self):
-        """Push commits to remote."""
+    def push(self, branch: str = None):
+        """Push commits to remote. Defaults to the configured base branch."""
         if not self.repo_url:
             log.info("No remote configured, skip push")
             return
 
+        push_branch = branch or self.branch
         # Ensure remote URL has auth token
         self._run(["remote", "set-url", "origin", self._auth_url()], check=False)
-        self._run(["push", "origin", self.branch])
-        log.info("Pushed to %s/%s", self.repo_url, self.branch)
+        self._run(["push", "origin", push_branch])
+        log.info("Pushed to %s/%s", self.repo_url, push_branch)
 
     def create_pr(self, title: str, body: str, source_branch: str,
                   target_branch: str = None) -> dict:
@@ -1008,7 +1089,6 @@ class GitClient:
                 data = resp.json()
                 return {"url": data.get("html_url", ""), "number": data.get("number", 0),
                         "status": "created"}
-            log.error("GitHub PR creation failed: HTTP %d: %s", resp.status_code, resp.text[:500])
             return {"url": "", "number": 0, "status": "error",
                     "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
 
@@ -1036,6 +1116,37 @@ class GitClient:
 
         return {"url": "", "number": 0, "status": "not_supported",
                 "error": f"Provider {self.provider} not supported for PR creation"}
+
+    def find_open_export_pr(self, branch_prefix: str = "policy-gitops/export-") -> dict:
+        """Return the first open PR whose head branch starts with branch_prefix, or {}.
+
+        Used to avoid opening duplicate export PRs when one is already pending review.
+        """
+        import requests
+
+        if self.provider != "github":
+            return {}
+
+        match = re.search(r"github\.com[/:]([^/]+)/([^/.]+)", self.repo_url)
+        if not match:
+            return {}
+        owner, repo = match.group(1), match.group(2)
+
+        try:
+            resp = requests.get(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                headers={"Authorization": f"token {self.token}", "Accept": "application/json"},
+                params={"state": "open", "per_page": 100},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                for pr in resp.json():
+                    if pr.get("head", {}).get("ref", "").startswith(branch_prefix):
+                        return {"url": pr["html_url"], "number": pr["number"],
+                                "branch": pr["head"]["ref"]}
+        except Exception as e:
+            log.warning("Could not check for open export PRs: %s", e)
+        return {}
 
     def get_changed_files(self) -> list:
         """Return list of files changed in the working tree (staged + unstaged + untracked).
@@ -1114,7 +1225,7 @@ class DriftDetector:
         # Fetch rulesets from PCE
         pce_rulesets = {}  # name -> serialized yaml_data
         try:
-            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/rule_sets", params={"max_results": 5000})
+            resp = pce.get("/sec_policy/active/rule_sets", params={"max_results": 5000})
             if resp.status_code == 200:
                 for rs in resp.json():
                     name = rs.get("name", "")
@@ -1172,7 +1283,7 @@ class DriftDetector:
         # Fetch PCE IP lists
         pce_ip_lists = {}
         try:
-            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
+            resp = pce.get("/sec_policy/active/ip_lists")
             if resp.status_code == 200:
                 for ipl in resp.json():
                     name = ipl.get("name", "")
@@ -1227,7 +1338,7 @@ class DriftDetector:
         # Fetch PCE services
         pce_services = {}
         try:
-            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
+            resp = pce.get("/sec_policy/active/services")
             if resp.status_code == 200:
                 for svc in resp.json():
                     name = svc.get("name", "")
@@ -1308,15 +1419,24 @@ class DriftDetector:
 # ===================================================================
 
 def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
-               scope_mapper: ScopeMapper, git_client: GitClient):
+               scope_mapper: ScopeMapper, git_client: GitClient,
+               reconcile: bool = False):
     """Export PCE policy to Git repository (PCE -> Git direction).
 
     Fetches all rulesets, IP lists, and services from the PCE, converts them
     to YAML, writes to the appropriate directories, and commits + pushes.
+
+    When reconcile=True, all existing YAML files in scopes/, ip-lists/, and
+    services/ are removed before writing, producing a clean full-state snapshot
+    rather than an incremental update.
     """
-    log.info("Starting export (PCE -> Git)...")
+    mode = "reconcile" if reconcile else "export"
+    log.info("Starting %s (PCE -> Git)...", mode)
     now = datetime.now(timezone.utc).isoformat()
-    counts = {"rulesets": 0, "ip_lists": 0, "services": 0}
+    counts = {"rulesets": 0, "ip_lists": 0, "services": 0, "deleted": 0}
+
+    export_branch = None
+    is_new_branch = False
 
     try:
         # Ensure we have latest from remote
@@ -1328,11 +1448,54 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
         repo_dir = git_client.repo_dir
         changed_files = []
 
+        # --- Set up export branch BEFORE writing files (EXPORT_AS_PR mode) ---
+        # Branch must be determined here so the working tree is on the correct
+        # branch when files are written, staged, and committed. Doing it after
+        # file writes would cause `git checkout` to overwrite those files.
+        if EXPORT_AS_PR and git_client.repo_url:
+            existing_pr = git_client.find_open_export_pr()
+            if existing_pr:
+                export_branch = existing_pr["branch"]
+                log.info(
+                    "Existing export PR #%d open (%s) — pushing new commits onto %s",
+                    existing_pr["number"], existing_pr["url"], export_branch,
+                )
+                git_client.fetch_and_checkout(export_branch)
+            else:
+                export_branch = (
+                    f"policy-gitops/export-"
+                    f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+                )
+                is_new_branch = True
+                git_client.checkout(export_branch, create=True)
+
+        # --- Full wipe for reconcile mode ---
+        if reconcile:
+            for subdir, glob in [("scopes", "**/*.yaml"), ("ip-lists", "*.yaml"), ("services", "*.yaml")]:
+                target = repo_dir / subdir
+                if not target.is_dir():
+                    continue
+                for f in target.rglob(glob) if subdir == "scopes" else target.glob(glob):
+                    if f.name.startswith("_") or f.name == ".gitkeep":
+                        continue
+                    changed_files.append(str(f.relative_to(repo_dir)))
+                    f.unlink()
+                    counts["deleted"] += 1
+            if counts["deleted"]:
+                log.info("Reconcile: removed %d existing YAML files before fresh export", counts["deleted"])
+
+        # Track PCE object names so we can remove stale files after writing.
+        # None means the fetch failed — do not delete anything for that type.
+        pce_ruleset_names = None
+        pce_iplist_names = None
+        pce_service_names = None
+
         # --- Export rulesets ---
         try:
-            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/rule_sets", params={"max_results": 5000})
+            resp = pce.get("/sec_policy/active/rule_sets", params={"max_results": 5000})
             if resp.status_code == 200:
                 rulesets = resp.json()
+                pce_ruleset_names = {rs.get("name") for rs in rulesets}
                 log.info("Fetched %d rulesets from PCE", len(rulesets))
 
                 for rs in rulesets:
@@ -1381,9 +1544,10 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
 
         # --- Export IP lists ---
         try:
-            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
+            resp = pce.get("/sec_policy/active/ip_lists")
             if resp.status_code == 200:
                 ip_lists = resp.json()
+                pce_iplist_names = {ipl.get("name") for ipl in ip_lists}
                 log.info("Fetched %d IP lists from PCE", len(ip_lists))
 
                 ip_lists_dir = repo_dir / "ip-lists"
@@ -1408,9 +1572,10 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
 
         # --- Export services ---
         try:
-            resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
+            resp = pce.get("/sec_policy/active/services")
             if resp.status_code == 200:
                 services = resp.json()
+                pce_service_names = {svc.get("name") for svc in services}
                 log.info("Fetched %d services from PCE", len(services))
 
                 services_dir = repo_dir / "services"
@@ -1433,6 +1598,68 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
         except Exception as e:
             log.error("Failed to export services: %s", e)
 
+        # --- Remove stale YAML files (objects deleted from PCE or scope-moved) ---
+        # Uses path-based matching: any existing YAML file whose path was NOT
+        # written in this export cycle is considered stale. This correctly handles:
+        #   - deleted PCE objects (file was never rewritten)
+        #   - scope-moved rulesets (old path not written; new path was)
+        #   - filename collisions across directories
+        #
+        # The pce_*_names None sentinel guards against wiping all files when a
+        # PCE fetch failed — if we never fetched that type, don't delete anything.
+        try:
+            # Snapshot of paths written this cycle (before we start deleting).
+            written_paths = set(changed_files)
+
+            scopes_dir = repo_dir / "scopes"
+            if pce_ruleset_names is not None and scopes_dir.is_dir():
+                for yaml_file in sorted(scopes_dir.rglob("*.yaml")):
+                    if yaml_file.name.startswith("_") or yaml_file.name == ".gitkeep":
+                        continue
+                    rel = str(yaml_file.relative_to(repo_dir))
+                    if rel not in written_paths:
+                        log.info("Removing stale ruleset file: %s", rel)
+                        changed_files.append(rel)
+                        yaml_file.unlink()
+                        counts["deleted"] += 1
+                # Remove empty scope directories left behind after deletions
+                for scope_dir in sorted(scopes_dir.rglob("*"), reverse=True):
+                    if scope_dir.is_dir() and scope_dir != scopes_dir:
+                        remaining = [f for f in scope_dir.iterdir()
+                                     if f.name != ".gitkeep" and not f.name.startswith("_")]
+                        if not remaining and not any(scope_dir.iterdir()):
+                            scope_dir.rmdir()
+                            log.info("Removed empty scope directory: %s", scope_dir.relative_to(repo_dir))
+
+            iplist_dir = repo_dir / "ip-lists"
+            if pce_iplist_names is not None and iplist_dir.is_dir():
+                for yaml_file in iplist_dir.glob("*.yaml"):
+                    if yaml_file.name == ".gitkeep":
+                        continue
+                    rel = str(yaml_file.relative_to(repo_dir))
+                    if rel not in written_paths:
+                        log.info("Removing stale IP list file: %s", rel)
+                        changed_files.append(rel)
+                        yaml_file.unlink()
+                        counts["deleted"] += 1
+
+            svc_dir = repo_dir / "services"
+            if pce_service_names is not None and svc_dir.is_dir():
+                for yaml_file in svc_dir.glob("*.yaml"):
+                    if yaml_file.name == ".gitkeep":
+                        continue
+                    rel = str(yaml_file.relative_to(repo_dir))
+                    if rel not in written_paths:
+                        log.info("Removing stale service file: %s", rel)
+                        changed_files.append(rel)
+                        yaml_file.unlink()
+                        counts["deleted"] += 1
+
+            if counts["deleted"]:
+                log.info("Removed %d stale file(s) for objects deleted or moved in PCE", counts["deleted"])
+        except Exception as e:
+            log.warning("Stale file cleanup failed: %s", e)
+
         # --- Generate CODEOWNERS ---
         try:
             codeowners_content = scope_mapper.build_codeowners(repo_dir)
@@ -1442,164 +1669,48 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
         except Exception as e:
             log.warning("Failed to generate CODEOWNERS: %s", e)
 
-        # --- Remove stale files (objects deleted from PCE) ---
-        deleted_count = 0
-        try:
-            # Build sets of filenames we just wrote
-            written_files = set(os.path.basename(f) for f in changed_files)
-
-            # Check scopes/ for stale rulesets
-            scopes_dir = repo_dir / "scopes"
-            if scopes_dir.exists():
-                for yaml_file in scopes_dir.rglob("*.yaml"):
-                    if yaml_file.name == "_scope.yaml":
-                        continue
-                    if yaml_file.name not in written_files:
-                        # Verify it's actually a ruleset file (has 'name' and 'rules')
-                        try:
-                            content = yaml.safe_load(yaml_file.read_text())
-                            if isinstance(content, dict) and "rules" in content:
-                                rel = str(yaml_file.relative_to(repo_dir))
-                                log.info("Removing stale ruleset file: %s", rel)
-                                yaml_file.unlink()
-                                changed_files.append(rel)
-                                deleted_count += 1
-                        except Exception:
-                            pass
-
-            # Check ip-lists/ for stale IP lists
-            iplists_dir = repo_dir / "ip-lists"
-            if iplists_dir.exists():
-                for yaml_file in iplists_dir.glob("*.yaml"):
-                    if yaml_file.name not in written_files:
-                        rel = str(yaml_file.relative_to(repo_dir))
-                        log.info("Removing stale IP list file: %s", rel)
-                        yaml_file.unlink()
-                        changed_files.append(rel)
-                        deleted_count += 1
-
-            # Check services/ for stale services
-            services_dir = repo_dir / "services"
-            if services_dir.exists():
-                for yaml_file in services_dir.glob("*.yaml"):
-                    if yaml_file.name not in written_files:
-                        rel = str(yaml_file.relative_to(repo_dir))
-                        log.info("Removing stale service file: %s", rel)
-                        yaml_file.unlink()
-                        changed_files.append(rel)
-                        deleted_count += 1
-
-            # Remove empty scope directories (no more rulesets, only _scope.yaml)
-            if scopes_dir.exists():
-                for scope_dir in scopes_dir.iterdir():
-                    if scope_dir.is_dir() and scope_dir.name != "_global":
-                        yaml_files = [f for f in scope_dir.glob("*.yaml") if f.name != "_scope.yaml"]
-                        if not yaml_files:
-                            # Remove _scope.yaml and the empty dir
-                            scope_yaml = scope_dir / "_scope.yaml"
-                            if scope_yaml.exists():
-                                scope_yaml.unlink()
-                                changed_files.append(str(scope_yaml.relative_to(repo_dir)))
-                            for gitkeep in scope_dir.glob(".gitkeep"):
-                                gitkeep.unlink()
-                            try:
-                                scope_dir.rmdir()
-                                log.info("Removed empty scope directory: %s", scope_dir.name)
-                            except OSError:
-                                pass
-
-            if deleted_count > 0:
-                log.info("Removed %d stale files from repo", deleted_count)
-
-        except Exception as e:
-            log.warning("Stale file cleanup failed: %s", e)
-
-        # --- Commit and push ---
-        total = counts["rulesets"] + counts["ip_lists"] + counts["services"]
+        # --- Commit and push (or open a PR) ---
+        deleted_summary = f", {counts['deleted']} deleted" if counts["deleted"] and not reconcile else ""
+        action = "full reconcile" if reconcile else "export"
         commit_msg = (
-            f"policy-gitops: export from PCE at {now}\n\n"
+            f"policy-gitops: {action} from PCE at {now}\n\n"
             f"Exported {counts['rulesets']} rulesets, "
             f"{counts['ip_lists']} IP lists, "
-            f"{counts['services']} services"
+            f"{counts['services']} services{deleted_summary}"
         )
-        if deleted_count > 0:
-            commit_msg += f"\nRemoved {deleted_count} stale files"
 
-        if EXPORT_AS_PR:
-            # Create a branch, commit there, push, and open a PR
-            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-            export_branch = f"policy-gitops/export-{ts}"
-            saved_branch = git_client.branch
-            git_client._run(["checkout", "-b", export_branch])
-            git_client.commit(commit_msg, changed_files)
+        # Reconcile uses git add -A to catch any manually-deleted tracked files
+        # that wouldn't appear in changed_files. Normal export stages specific paths.
+        commit_files = None if reconcile else changed_files
 
-            # Check if the commit actually produced a new commit
-            result = git_client._run(["rev-list", f"origin/{saved_branch}..HEAD", "--count"],
-                                      check=False)
-            commit_count = int(result.stdout.strip()) if result and result.stdout.strip().isdigit() else 0
-
-            if commit_count > 0:
-                # Check if there's already an open PR from policy-gitops
-                has_open_pr = False
-                try:
-                    import requests as req
-                    match = re.search(r"github\.com[/:]([^/]+)/([^/.]+)", git_client.repo_url)
-                    if match:
-                        owner, repo_name = match.group(1), match.group(2)
-                        resp = req.get(
-                            f"https://api.github.com/repos/{owner}/{repo_name}/pulls",
-                            headers={"Authorization": f"token {git_client.token}", "Accept": "application/json"},
-                            params={"state": "open"},
-                            timeout=15,
-                        )
-                        if resp.status_code == 200:
-                            for p in resp.json():
-                                branch = p.get("head", {}).get("ref", "")
-                                if branch.startswith("policy-gitops/export-"):
-                                    has_open_pr = True
-                                    log.info("Open export PR already exists (#%d, branch=%s) — skipping",
-                                             p["number"], branch)
-                                    break
-                except Exception as e:
-                    log.warning("Could not check for existing PRs: %s", e)
-
-                if not has_open_pr:
-                    # Push the export branch and create PR
-                    git_client.branch = export_branch
-                    git_client.push()
-                    git_client.branch = saved_branch
-                    try:
-                        pr_body = (
-                            f"## Policy Export from PCE\n\n"
-                            f"**Exported at:** {now}\n\n"
-                            f"| Object | Count |\n|--------|-------|\n"
-                            f"| Rulesets | {counts['rulesets']} |\n"
-                            f"| IP Lists | {counts['ip_lists']} |\n"
-                            f"| Services | {counts['services']} |\n\n"
-                            f"Review the changes and merge to accept this policy snapshot.\n\n"
-                            f"---\n*Generated by policy-gitops*"
-                        )
-                        pr = git_client.create_pr(
-                            title=f"Policy export {ts}",
-                            body=pr_body,
-                            source_branch=export_branch,
-                            target_branch=saved_branch,
-                        )
-                        if pr.get("status") == "created":
-                            log.info("Created PR: %s", pr.get("url", ""))
-                        else:
-                            log.error("PR creation failed: %s", pr.get("error", "unknown"))
-                    except Exception as e:
-                        log.error("Failed to create PR: %s", e)
+        export_pr_url = None
+        if EXPORT_AS_PR and git_client.repo_url:
+            # Branch is already set up (before file writes); just commit and push.
+            committed = git_client.commit(commit_msg, commit_files)
+            if committed:
+                git_client.push(export_branch)
+                if is_new_branch:
+                    pr_body = (
+                        f"Automated PCE export at {now}\n\n"
+                        f"**Changes:** {counts['rulesets']} rulesets, "
+                        f"{counts['ip_lists']} IP lists, "
+                        f"{counts['services']} services\n\n"
+                        f"Review the diff and merge to record these changes as the new "
+                        f"Git source of truth. The validate pipeline will run on this PR."
+                    )
+                    pr = git_client.create_pr(
+                        title=f"policy-gitops: PCE export {now[:10]}",
+                        body=pr_body,
+                        source_branch=export_branch,
+                    )
+                    export_pr_url = pr.get("url", "")
+                    log.info("Created export PR: %s", export_pr_url)
+                else:
+                    log.info("Pushed new commits onto existing export PR branch: %s", export_branch)
             else:
-                log.info("No policy changes detected — skipping PR creation")
-
-            # Switch back to main
-            git_client._run(["checkout", saved_branch])
-            git_client._run(["branch", "-D", export_branch], check=False)
+                log.info("No changes to export — skipping PR")
         else:
-            # Direct push to main
-            git_client.commit(commit_msg, changed_files)
+            git_client.commit(commit_msg, commit_files)
             git_client.push()
 
         with state_lock:
@@ -1607,14 +1718,26 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
             app_state["export_count"] += 1
             app_state["exported_objects"] = counts
             app_state["last_error"] = None
+            if export_pr_url:
+                app_state["last_export_pr"] = export_pr_url
+            if reconcile:
+                app_state["last_reconcile"] = now
 
-        log.info("Export complete: %d rulesets, %d IP lists, %d services",
-                 counts["rulesets"], counts["ip_lists"], counts["services"])
+        log.info("%s complete: %d rulesets, %d IP lists, %d services",
+                 action.title(), counts["rulesets"], counts["ip_lists"], counts["services"])
 
     except Exception as e:
         log.exception("Export failed")
         with state_lock:
             app_state["last_error"] = f"Export failed: {e}"
+    finally:
+        # Always return to the base branch after EXPORT_AS_PR operations so
+        # subsequent pulls and file reads operate on the expected branch.
+        if export_branch:
+            try:
+                git_client.checkout(git_client.branch)
+            except Exception as e:
+                log.warning("Failed to return to base branch after export: %s", e)
 
 
 def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
@@ -1655,7 +1778,7 @@ def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
         # Fall back to active if draft is empty
         if not pce_rulesets:
             try:
-                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/rule_sets", params={"max_results": 5000})
+                resp = pce.get("/sec_policy/active/rule_sets", params={"max_results": 5000})
                 if resp.status_code == 200:
                     for rs in resp.json():
                         pce_rulesets[rs.get("name", "")] = rs.get("href", "")
@@ -1671,7 +1794,7 @@ def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
             pass
         if not pce_ip_lists:
             try:
-                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
+                resp = pce.get("/sec_policy/active/ip_lists")
                 if resp.status_code == 200:
                     for ipl in resp.json():
                         pce_ip_lists[ipl.get("name", "")] = ipl.get("href", "")
@@ -1687,7 +1810,7 @@ def run_provision(pce: PolicyComputeEngine, serializer: PolicySerializer,
             pass
         if not pce_services:
             try:
-                resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
+                resp = pce.get("/sec_policy/active/services")
                 if resp.status_code == 200:
                     for svc in resp.json():
                         pce_services[svc.get("name", "")] = svc.get("href", "")
@@ -2026,10 +2149,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="card fade-in">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;">
                 <h2 style="margin-bottom:0;">Export Status (PCE -> Git)</h2>
-                <button class="btn btn-primary" onclick="triggerExport()">Run Export</button>
-                <button class="btn" style="margin-left:8px;background:#6c7086;" onclick="triggerReconcile()">Full Reconcile</button>
+                <div style="display:flex;gap:8px;">
+                    <button class="btn btn-primary" onclick="triggerExport()">Run Export</button>
+                    <button class="btn" onclick="triggerReconcile()" style="border-color:#f38ba8;color:#f38ba8;" title="Wipe repo and re-export full PCE state from scratch">Full Reconcile</button>
+                </div>
             </div>
             <div class="kv"><span class="kv-key">Last export</span><span class="kv-val" id="last-export">never</span></div>
+            <div class="kv"><span class="kv-key">Last reconcile</span><span class="kv-val" id="last-reconcile">never</span></div>
             <div class="kv"><span class="kv-key">Export count</span><span class="kv-val" id="export-count">0</span></div>
             <div class="kv"><span class="kv-key">Rulesets</span><span class="kv-val" id="export-rulesets">0</span></div>
             <div class="kv"><span class="kv-key">IP Lists</span><span class="kv-val" id="export-iplists">0</span></div>
@@ -2150,6 +2276,7 @@ async function fetchState() {
 
         // Export tab
         document.getElementById('last-export').textContent = fmt(s.last_export);
+        document.getElementById('last-reconcile').textContent = fmt(s.last_reconcile);
         document.getElementById('export-count').textContent = s.export_count;
         const eo = s.exported_objects || {};
         document.getElementById('export-rulesets').textContent = eo.rulesets || 0;
@@ -2211,11 +2338,12 @@ async function triggerExport() {
 }
 
 async function triggerReconcile() {
+    if (!confirm('Full Reconcile: this will DELETE all YAML files in the repo and re-export the complete PCE state from scratch.\\n\\nAll hand-edited files not backed by a PCE object will be lost.\\n\\nContinue?')) return;
     try {
         const resp = await fetch(BASE + '/api/reconcile', { method: 'POST' });
         const data = await resp.json();
         alert(data.message || 'Reconcile triggered');
-        setTimeout(fetchState, 2000);
+        setTimeout(fetchState, 1000);
     } catch (e) {
         alert('Failed to trigger reconcile: ' + e);
     }
@@ -2312,11 +2440,13 @@ class GitOpsHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"message": "Drift check triggered", "status": "accepted"})
 
         elif path == "/api/reconcile":
-            # Full reconcile: export + delete stale files + commit + PR/push
-            def _reconcile():
-                run_export(self.pce, self.serializer, self.scope_mapper, self.git_client)
-            threading.Thread(target=_reconcile, daemon=True).start()
-            self.send_json(200, {"message": "Reconcile triggered (export + cleanup)", "status": "accepted"})
+            threading.Thread(
+                target=run_export,
+                args=(self.pce, self.serializer, self.scope_mapper, self.git_client),
+                kwargs={"reconcile": True},
+                daemon=True,
+            ).start()
+            self.send_json(200, {"message": "Reconcile triggered — wiping repo and re-exporting full PCE state", "status": "accepted"})
 
         else:
             self.send_error(404)
