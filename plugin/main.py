@@ -1475,15 +1475,17 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
                         resp = req.get(
                             f"https://api.github.com/repos/{owner}/{repo_name}/pulls",
                             headers={"Authorization": f"token {git_client.token}", "Accept": "application/json"},
-                            params={"state": "open", "head": f"{owner}:policy-gitops/"},
+                            params={"state": "open"},
                             timeout=15,
                         )
                         if resp.status_code == 200:
-                            open_prs = [p for p in resp.json() if p.get("head", {}).get("ref", "").startswith("policy-gitops/")]
-                            if open_prs:
-                                has_open_pr = True
-                                log.info("Open export PR already exists (#%d) — skipping duplicate",
-                                         open_prs[0]["number"])
+                            for p in resp.json():
+                                branch = p.get("head", {}).get("ref", "")
+                                if branch.startswith("policy-gitops/export-"):
+                                    has_open_pr = True
+                                    log.info("Open export PR already exists (#%d, branch=%s) — skipping",
+                                             p["number"], branch)
+                                    break
                 except Exception as e:
                     log.warning("Could not check for existing PRs: %s", e)
 
