@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   provision:
-    name: Provision to PCE Draft
+    name: Provision to PCE
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,34 +30,18 @@ jobs:
           COUNT=$(echo "$CHANGED" | grep -c '.' || true)
           echo "count=$COUNT" >> $GITHUB_OUTPUT
 
-      - name: Check for bot export commit
-        id: bot
-        run: |
-          # Export commits (plugin syncing PCE -> Git) start with "policy-gitops:"
-          # or are authored by the policy-gitops bot. Skip provisioning for these —
-          # the content already came FROM the PCE and must not be sent back.
-          MSG=$(git log --no-merges -1 --format='%s' 2>/dev/null || git log -1 --format='%s')
-          AUTHOR=$(git log --no-merges -1 --format='%an' 2>/dev/null || git log -1 --format='%an')
-          if [[ "$MSG" == policy-gitops:* ]] || [[ "$AUTHOR" == "policy-gitops" ]]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            echo "Skipping provision: bot export commit detected (author=$AUTHOR)"
-          else
-            echo "skip=false" >> $GITHUB_OUTPUT
-            echo "Human commit detected — will provision (author=$AUTHOR)"
-          fi
-
       - name: Setup Python
-        if: steps.changes.outputs.count != '0' && steps.bot.outputs.skip != 'true'
+        if: steps.changes.outputs.count != '0'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Install dependencies
-        if: steps.changes.outputs.count != '0' && steps.bot.outputs.skip != 'true'
+        if: steps.changes.outputs.count != '0'
         run: pip install illumio pyyaml
 
       - name: Provision to PCE draft
-        if: steps.changes.outputs.count != '0' && steps.bot.outputs.skip != 'true'
+        if: steps.changes.outputs.count != '0'
         env:
           PCE_HOST: ${{ secrets.PCE_HOST }}
           PCE_PORT: ${{ secrets.PCE_PORT }}
