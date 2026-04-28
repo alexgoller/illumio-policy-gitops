@@ -70,6 +70,15 @@ rules:
     description: "IP lists with /8 or broader CIDRs are very permissive"
 
   - id: SEC-008
+    name: "Overly broad rule consumer"
+    severity: high
+    action: warn
+    description: >
+      Rules with 'All Workloads' (ams) or an Any/RFC-1918 IP list as consumer and no
+      role label on the provider side expose every workload to the internet or internal
+      broadcast. Add a role label to providers or tighten the consumer definition.
+
+  - id: SEC-009
     name: "HTTP without HTTPS"
     severity: medium
     action: warn

@@ -1,6 +1,6 @@
 apiVersion: plugger/v1
 name: policy-gitops
-version: 0.1.0
+version: 0.2.0
 image: policy-gitops:latest
 
 schedule:
@@ -30,6 +30,12 @@ env:
     required: false
     default: "true"
   - name: EXPORT_AS_PR
+    required: false
+    default: "false"
+  - name: EXPORT_LABELS
+    required: false
+    default: "false"
+  - name: DRIFT_AUTO_PR
     required: false
     default: "false"
   - name: PCE_TLS_SKIP_VERIFY
