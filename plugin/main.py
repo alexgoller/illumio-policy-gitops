@@ -149,10 +149,11 @@ class PolicySerializer:
 
     def __init__(self, pce: PolicyComputeEngine):
         self.pce = pce
-        self._label_cache = {}       # href -> {key, value}
-        self._label_reverse = {}     # "key:value" -> href
-        self._service_cache = {}     # href -> service dict
-        self._ip_list_cache = {}     # href -> ip_list dict
+        self._label_cache = {}        # href -> {key, value}
+        self._label_reverse = {}      # "key:value" -> href
+        self._service_cache = {}      # href -> service dict
+        self._ip_list_cache = {}      # href -> ip_list dict
+        self._label_group_cache = {}  # href -> label_group dict
 
     # ------------------------------------------------------------------
     # Cache management
@@ -200,11 +201,25 @@ class PolicySerializer:
         except Exception as e:
             log.warning("Failed to fetch IP lists: %s", e)
 
+    def refresh_label_group_cache(self):
+        """Fetch all label groups from PCE and cache href -> label_group mapping."""
+        try:
+            resp = self.pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/label_groups")
+            if resp.status_code == 200:
+                for lg in resp.json():
+                    href = lg.get("href", "")
+                    if href:
+                        self._label_group_cache[href] = lg
+                log.info("Cached %d label groups", len(self._label_group_cache))
+        except Exception as e:
+            log.warning("Failed to fetch label groups: %s", e)
+
     def refresh_all_caches(self):
-        """Refresh all caches (labels, services, IP lists)."""
+        """Refresh all caches (labels, services, IP lists, label groups)."""
         self.refresh_label_cache()
         self.refresh_service_cache()
         self.refresh_ip_list_cache()
+        self.refresh_label_group_cache()
 
     # ------------------------------------------------------------------
     # Label resolution helpers
@@ -249,6 +264,9 @@ class PolicySerializer:
         if "label_group" in actor:
             lg = actor["label_group"]
             href = lg.get("href", "") if isinstance(lg, dict) else ""
+            cached = self._label_group_cache.get(href)
+            if cached:
+                return {"label_group": {"name": cached.get("name", href)}}
             return {"label_group": {"href": href}}
 
         if "ip_list" in actor:
@@ -266,11 +284,14 @@ class PolicySerializer:
 
         return actor
 
-    def _resolve_service_to_yaml(self, svc: dict) -> dict:
+    def _resolve_service_to_yaml(self, svc: dict):
         """Convert a single PCE ingress_service entry to YAML format.
 
+        Returns a dict for single-port services, or a list of dicts for
+        multi-port named services (caller must flatten).
+
         PCE formats:
-          - {"href": "..."} -> service reference
+          - {"href": "..."} -> service reference (resolved with port info)
           - {"port": N, "proto": N} -> inline port/proto
           - {"port": N, "to_port": N, "proto": N} -> port range
         """
@@ -279,7 +300,33 @@ class PolicySerializer:
             href = svc["href"]
             cached = self._service_cache.get(href)
             if cached:
-                return {"name": cached.get("name", href)}
+                name = cached.get("name", href)
+                ports = cached.get("service_ports", [])
+                if len(ports) == 1:
+                    sp = ports[0]
+                    entry = {"name": name}
+                    if "port" in sp:
+                        entry["port"] = sp["port"]
+                        if sp.get("to_port") and sp["to_port"] != sp["port"]:
+                            entry["to_port"] = sp["to_port"]
+                    if "proto" in sp:
+                        entry["proto"] = _proto_num_to_name(sp["proto"])
+                    return entry
+                elif len(ports) > 1:
+                    # Expand to one entry per port so callers can check svc["port"]
+                    entries = []
+                    for sp in ports:
+                        entry = {"name": name}
+                        if "port" in sp:
+                            entry["port"] = sp["port"]
+                            if sp.get("to_port") and sp["to_port"] != sp["port"]:
+                                entry["to_port"] = sp["to_port"]
+                        if "proto" in sp:
+                            entry["proto"] = _proto_num_to_name(sp["proto"])
+                        entries.append(entry)
+                    return entries
+                # No port info (Windows-only services, etc.)
+                return {"name": name}
             return {"href": href}
 
         # Inline port/proto
@@ -320,6 +367,19 @@ class PolicySerializer:
                     return {"label": {"href": f"unresolved:{key}={value}"}}
             return actor
 
+        if "label_group" in actor:
+            lg = actor["label_group"]
+            if isinstance(lg, dict):
+                if "href" in lg:
+                    return {"label_group": {"href": lg["href"]}}
+                if "name" in lg:
+                    name = lg["name"]
+                    for href, cached in self._label_group_cache.items():
+                        if cached.get("name") == name:
+                            return {"label_group": {"href": href}}
+                    log.warning("Label group not found: %s", name)
+            return actor
+
         if "ip_list" in actor:
             ipl = actor["ip_list"]
             if isinstance(ipl, dict) and "name" in ipl:
@@ -343,13 +403,15 @@ class PolicySerializer:
           - {"port": N, "to_port": N, "proto": "tcp"} -> port range
           - {"name": "..."} -> service reference by name
         """
-        if "name" in svc and "port" not in svc:
+        # Name takes priority — embedded port/proto is informational metadata added
+        # during export and must not override the service reference on import.
+        if "name" in svc:
             name = svc["name"]
             for href, cached in self._service_cache.items():
                 if cached.get("name") == name:
                     return {"href": href}
-            log.warning("Service not found: %s", name)
-            return svc
+            log.warning("Service not found by name: %s — falling back to inline port", name)
+            # Fall through to inline port handling if name lookup fails
 
         if "port" in svc:
             result = {
@@ -469,7 +531,14 @@ class PolicySerializer:
         """Convert a single PCE rule to YAML format."""
         consumers = [self._resolve_actor_to_yaml(a) for a in rule.get("consumers", [])]
         providers = [self._resolve_actor_to_yaml(a) for a in rule.get("providers", [])]
-        services = [self._resolve_service_to_yaml(s) for s in rule.get("ingress_services", [])]
+        # _resolve_service_to_yaml returns a list for multi-port named services — flatten.
+        services = []
+        for s in rule.get("ingress_services", []):
+            resolved = self._resolve_service_to_yaml(s)
+            if isinstance(resolved, list):
+                services.extend(resolved)
+            else:
+                services.append(resolved)
 
         # Use description if present; generate a readable name from content otherwise.
         # PCE hrefs ("/orgs/...") are never useful as names.
