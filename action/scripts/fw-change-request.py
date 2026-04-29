@@ -28,6 +28,7 @@ import csv
 import json
 import os
 import subprocess
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import yaml
@@ -298,45 +299,86 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # ── CSV output ────────────────────────────────────────────────────────────
-    csv_path = os.path.join(args.out_dir, "fw-change-request.csv")
     fieldnames = [
         "change_type", "action", "rule_name", "ruleset", "file",
         "source_ip", "destination_ip", "port", "protocol", "service_name",
     ]
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    added   = sum(1 for r in all_rules_structured if r["change_type"] == "added")
+    deleted = sum(1 for r in all_rules_structured if r["change_type"] == "deleted")
+    modified = sum(1 for r in all_rules_structured if r["change_type"] == "modified")
+
+    # ── Per-scope files (mirroring directory structure) ───────────────────────
+    tuples_by_file: dict[str, list] = defaultdict(list)
+    rules_by_file: dict[str, list] = defaultdict(list)
+    for t in all_tuples:
+        tuples_by_file[t["file"]].append(t)
+    for r in all_rules_structured:
+        rules_by_file[r["file"]].append(r)
+
+    for filepath, tuples in tuples_by_file.items():
+        base = os.path.splitext(filepath)[0]          # scopes/app-ad_env-prod/ad-prod
+        scope_out = os.path.join(args.out_dir, base)  # fw-changes/scopes/app-ad_env-prod/ad-prod
+        os.makedirs(os.path.dirname(scope_out), exist_ok=True)
+
+        with open(scope_out + ".csv", "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(tuples)
+
+        scope_rules = rules_by_file[filepath]
+        s_added    = sum(1 for r in scope_rules if r["change_type"] == "added")
+        s_deleted  = sum(1 for r in scope_rules if r["change_type"] == "deleted")
+        s_modified = sum(1 for r in scope_rules if r["change_type"] == "modified")
+        with open(scope_out + ".json", "w") as f:
+            json.dump({
+                "generated_at": generated_at,
+                "commit": args.commit,
+                "pr_title": args.pr_title,
+                "scope_file": filepath,
+                "summary": {
+                    "total_rules": len(scope_rules),
+                    "added": s_added,
+                    "deleted": s_deleted,
+                    "modified": s_modified,
+                    "total_fw_tuples": len(tuples),
+                },
+                "rules": scope_rules,
+            }, f, indent=2)
+
+        print(f"  {scope_out}.csv  ({len(tuples)} tuples, {s_added}+ {s_deleted}- {s_modified}~)")
+
+    # ── Combined files (full PR overview) ─────────────────────────────────────
+    csv_path  = os.path.join(args.out_dir, "fw-change-request.csv")
+    json_path = os.path.join(args.out_dir, "fw-change-request.json")
+
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(all_tuples)
 
-    # ── JSON output ───────────────────────────────────────────────────────────
-    json_path = os.path.join(args.out_dir, "fw-change-request.json")
-    added   = sum(1 for r in all_rules_structured if r["change_type"] == "added")
-    deleted = sum(1 for r in all_rules_structured if r["change_type"] == "deleted")
-    modified = sum(1 for r in all_rules_structured if r["change_type"] == "modified")
-
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "commit": args.commit,
-        "pr_title": args.pr_title,
-        "summary": {
-            "total_rules": len(all_rules_structured),
-            "added": added,
-            "deleted": deleted,
-            "modified": modified,
-            "total_fw_tuples": len(all_tuples),
-        },
-        "rules": all_rules_structured,
-    }
     with open(json_path, "w") as f:
-        json.dump(payload, f, indent=2)
+        json.dump({
+            "generated_at": generated_at,
+            "commit": args.commit,
+            "pr_title": args.pr_title,
+            "summary": {
+                "total_rules": len(all_rules_structured),
+                "added": added,
+                "deleted": deleted,
+                "modified": modified,
+                "total_fw_tuples": len(all_tuples),
+            },
+            "rules": all_rules_structured,
+        }, f, indent=2)
 
     print(
         f"Firewall change request: {len(all_tuples)} tuples from {len(all_rules_structured)} rules "
         f"({added} added, {deleted} deleted, {modified} modified)"
     )
-    print(f"  CSV:  {csv_path}")
-    print(f"  JSON: {json_path}")
+    print(f"  Combined CSV:  {csv_path}")
+    print(f"  Combined JSON: {json_path}")
 
 
 if __name__ == "__main__":
