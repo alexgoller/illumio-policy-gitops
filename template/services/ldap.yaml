@@ -1,0 +1,11 @@
+name: LDAP
+description: "LDAP directory service (plaintext and TLS)"
+service_ports:
+  - port: 389
+    proto: tcp
+  - port: 636
+    proto: tcp
+  - port: 3268
+    proto: tcp
+  - port: 3269
+    proto: tcp

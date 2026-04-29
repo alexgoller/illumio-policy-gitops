@@ -1,0 +1,62 @@
+name: ad-prod-intra
+description: "Active Directory production — intra-scope rules"
+enabled: true
+
+scopes:
+  - - label: {app: ad}
+    - label: {env: prod}
+
+rules:
+  # DC replication — required between all domain controllers
+  - name: dc-replication
+    description: "AD replication traffic between domain controllers (RPC + SMB)"
+    enabled: true
+    consumers:
+      - label: {role: dc}
+    providers:
+      - label: {role: dc}
+    services:
+      - {port: 135, proto: tcp}    # RPC endpoint mapper
+      - {port: 445, proto: tcp}    # SMB (SYSVOL/NETLOGON replication)
+      - {port: 389, proto: tcp}    # LDAP
+      - {port: 636, proto: tcp}    # LDAPS
+      - {port: 3268, proto: tcp}   # Global Catalog
+      - {port: 3269, proto: tcp}   # Global Catalog SSL
+      - name: All Services         # RPC dynamic ports (49152-65535)
+
+  # DNS resolution — DCs serve internal DNS
+  - name: dns-server
+    description: "DNS service hosted on domain controllers"
+    enabled: true
+    consumers:
+      - label: {role: dc}
+    providers:
+      - label: {role: dc}
+    services:
+      - {port: 53, proto: tcp}
+      - {port: 53, proto: udp}
+
+  # NTP — DCs sync time with each other (PDC emulator is authoritative)
+  - name: ntp-internal
+    description: "NTP time sync between domain controllers"
+    enabled: true
+    consumers:
+      - label: {role: dc}
+    providers:
+      - label: {role: dc}
+    services:
+      - {port: 123, proto: udp}
+
+deny_rules:
+  # Block any DC from initiating outbound connections to the internet
+  - name: deny-dc-to-internet
+    description: "Domain controllers must not initiate outbound internet connections"
+    type: deny
+    enabled: true
+    consumers:
+      - label: {role: dc}
+    providers:
+      - ip_list: {name: "Any (0.0.0.0/0 and ::/0)"}
+    services:
+      - {port: 80, proto: tcp}
+      - {port: 443, proto: tcp}

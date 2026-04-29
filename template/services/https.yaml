@@ -1,0 +1,7 @@
+name: HTTPS
+description: "HTTPS web traffic"
+service_ports:
+  - port: 443
+    proto: tcp
+  - port: 8443
+    proto: tcp

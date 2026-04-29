@@ -1,0 +1,8 @@
+name: ad-prod
+labels:
+  app: ad
+  env: prod
+owners:
+  - team: infrastructure-team
+    github: "@org/infrastructure-team"
+description: "Active Directory — production domain controllers"

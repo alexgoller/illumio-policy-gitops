@@ -1,0 +1,8 @@
+name: payments-prod
+labels:
+  app: payments
+  env: prod
+owners:
+  - team: payments-team
+    github: "@org/payments-team"
+description: "Payment processing application — production"
