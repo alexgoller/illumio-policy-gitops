@@ -1638,10 +1638,14 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
             resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/rule_sets", params={"max_results": 5000})
             if resp.status_code == 200:
                 rulesets = resp.json()
-                pce_ruleset_names = {rs.get("name") for rs in rulesets}
+                pce_ruleset_names = {rs.get("name") for rs in rulesets
+                                     if rs.get("update_type") != "delete"}
                 log.info("Fetched %d rulesets from PCE", len(rulesets))
 
                 for rs in rulesets:
+                    if rs.get("update_type") == "delete":
+                        log.info("Skipping ruleset '%s' (pending deletion in PCE draft)", rs.get("name"))
+                        continue
                     yaml_data = serializer.export_ruleset_to_yaml(rs)
                     directory = scope_mapper.map_ruleset_to_directory(rs)
                     dir_path = repo_dir / directory
@@ -1690,13 +1694,17 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
             resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
             if resp.status_code == 200:
                 ip_lists = resp.json()
-                pce_iplist_names = {ipl.get("name") for ipl in ip_lists}
+                pce_iplist_names = {ipl.get("name") for ipl in ip_lists
+                                    if ipl.get("update_type") != "delete"}
                 log.info("Fetched %d IP lists from PCE", len(ip_lists))
 
                 ip_lists_dir = repo_dir / "ip-lists"
                 ip_lists_dir.mkdir(parents=True, exist_ok=True)
 
                 for ipl in ip_lists:
+                    if ipl.get("update_type") == "delete":
+                        log.info("Skipping IP list '%s' (pending deletion in PCE draft)", ipl.get("name"))
+                        continue
                     yaml_data = serializer.export_ip_list_to_yaml(ipl)
                     filename = _sanitize_filename(ipl.get("name", "unnamed")) + ".yaml"
                     file_path = ip_lists_dir / filename
@@ -1718,13 +1726,17 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
             resp = pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
             if resp.status_code == 200:
                 services = resp.json()
-                pce_service_names = {svc.get("name") for svc in services}
+                pce_service_names = {svc.get("name") for svc in services
+                                     if svc.get("update_type") != "delete"}
                 log.info("Fetched %d services from PCE", len(services))
 
                 services_dir = repo_dir / "services"
                 services_dir.mkdir(parents=True, exist_ok=True)
 
                 for svc in services:
+                    if svc.get("update_type") == "delete":
+                        log.info("Skipping service '%s' (pending deletion in PCE draft)", svc.get("name"))
+                        continue
                     yaml_data = serializer.export_service_to_yaml(svc)
                     filename = _sanitize_filename(svc.get("name", "unnamed")) + ".yaml"
                     file_path = services_dir / filename
