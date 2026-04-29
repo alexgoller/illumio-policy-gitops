@@ -85,7 +85,7 @@ def _fmt_evidence(ev: dict) -> tuple[str, str]:
     if ev.get("traffic_found"):
         conns = ev.get("blocked_connections", 0)
         sources = ev.get("unique_sources", 0)
-        return "✅", f"{conns:,} blocked · {sources} src"
+        return "✅", f"traffic found ({conns:,} blocked · {sources} src)"
     reason = (ev.get("reason") or ev.get("error") or "No evidence").rstrip(".")
     if len(reason) > 55:
         reason = reason[:52] + "…"
@@ -436,10 +436,15 @@ def render(
         # ── Security findings callout ─────────────────────────────────────────
         if file_findings:
             for f in file_findings:
-                icon = "❌" if f["action"] == "block" else "⚠️"
+                if f["action"] == "block":
+                    icon = "❌"
+                    pr_impact = " — **blocks this PR**"
+                else:
+                    icon = "⚠️"
+                    pr_impact = " — _potentially blocks this PR_"
                 rule_ref = f.get("context", "")
-                ctx = f" — _{rule_ref}_" if rule_ref else ""
-                lines.append(f"> {icon} **{f['rule_id']}** `{f['severity']}` — {f['message']}{ctx}")
+                ctx = f" · _{rule_ref}_" if rule_ref else ""
+                lines.append(f"> {icon} **{f['rule_id']}** `{f['severity']}` — {f['message']}{pr_impact}{ctx}")
             lines.append("")
 
         lines.append("---\n")
@@ -447,7 +452,7 @@ def render(
     # ── Footer summary table ─────────────────────────────────────────────────
     lines.append("### Summary\n")
     status_icon = "❌" if ss.get("blocked") else "✅"
-    status_text = "**BLOCKED** — critical findings require resolution" if ss.get("blocked") else "Clear to merge"
+    status_text = "**BLOCKED** — critical findings detected, this PR cannot merge" if ss.get("blocked") else "Clear to merge"
 
     lines.append("| | | |")
     lines.append("|:---:|---|---|")
@@ -458,12 +463,14 @@ def render(
     high = ss.get("high", 0)
     med = ss.get("medium", 0)
     if crit or high or med:
-        sec_text = " · ".join(filter(None, [
-            f"{crit} critical" if crit else "",
-            f"{high} high" if high else "",
-            f"{med} medium" if med else "",
-        ]))
-        lines.append(f"| 🛡️ | Security findings | {sec_text} |")
+        sec_parts = []
+        if crit:
+            sec_parts.append(f"{crit} critical — **blocks this PR**")
+        if high:
+            sec_parts.append(f"{high} high — _potentially blocks this PR_")
+        if med:
+            sec_parts.append(f"{med} medium — _potentially blocks this PR_")
+        lines.append(f"| 🛡️ | Security findings | {' · '.join(sec_parts)} |")
     else:
         lines.append("| 🛡️ | Security | All checks passed |")
 
