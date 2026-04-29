@@ -116,6 +116,12 @@ def _fmt_evidence(ev: dict) -> tuple[str, str]:
     """Return (status_icon, evidence_text) for a traffic evidence entry."""
     if ev is None:
         return "—", "—"
+    if ev.get("is_deletion_impact"):
+        conns = ev.get("allowed_connections", 0)
+        if ev.get("traffic_found") and conns:
+            sources = ev.get("unique_sources", 0)
+            return "🔴", f"**{conns:,} active connections** — removing blocks them ({sources} src)"
+        return "✅", "no active traffic — safe to remove"
     if ev.get("traffic_found"):
         conns = ev.get("blocked_connections", 0)
         sources = ev.get("unique_sources", 0)

@@ -85,6 +85,7 @@ jobs:
           python3 .github/scripts/traffic-evidence.py \
             --changed-files "${{ steps.changes.outputs.files }}" \
             --lookback-days 30 \
+            --diff-base origin/main \
             --output traffic-report.json
         continue-on-error: true
 

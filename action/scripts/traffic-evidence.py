@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone, timedelta
 
@@ -27,6 +28,24 @@ try:
     HAS_ILLUMIO = True
 except ImportError:
     HAS_ILLUMIO = False
+
+
+def _get_base_data(filepath: str, diff_base: str) -> dict:
+    try:
+        raw = subprocess.check_output(
+            ["git", "show", f"{diff_base}:{filepath}"],
+            stderr=subprocess.DEVNULL,
+        )
+        return yaml.safe_load(raw) or {}
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+
+
+def _diff_rules(base_data: dict, current_data: dict) -> dict[str, str]:
+    """Return {rule_name: 'deleted'} for rules present in base but not current."""
+    base = {r.get("name", "(unnamed)") for r in base_data.get("rules", []) if isinstance(r, dict)}
+    current = {r.get("name", "(unnamed)") for r in current_data.get("rules", []) if isinstance(r, dict)}
+    return {name: "deleted" for name in base - current}
 
 
 def load_traffic_config(cli_lookback_days: int) -> dict:
@@ -221,17 +240,23 @@ def _make_verdict(total_connections: int, thresholds: dict, lookback_days: int,
 
 
 def query_traffic_for_rule(pce, rule: dict, scope_cfg: dict, global_config: dict,
-                           service_port_map: dict = None) -> dict:
-    """Query PCE for blocked traffic matching a rule's pattern."""
+                           service_port_map: dict = None,
+                           policy_decisions: list = None) -> dict:
+    """Query PCE for traffic matching a rule's pattern.
+
+    policy_decisions defaults to blocked+potentially_blocked for new/changed rules.
+    Pass ["allowed"] to assess deletion impact.
+    """
     if not pce:
         return None
 
     lookback_days = scope_cfg.get("lookback_days", 30)
     min_connections = scope_cfg.get("min_connections", 1)
     exclude_ports = set(global_config.get("query", {}).get("exclude_ports", []))
-    policy_decisions = global_config.get("query", {}).get(
-        "policy_decisions", ["blocked", "potentially_blocked"]
-    )
+    if policy_decisions is None:
+        policy_decisions = global_config.get("query", {}).get(
+            "policy_decisions", ["blocked", "potentially_blocked"]
+        )
     thresholds = global_config.get("thresholds", {})
 
     services = rule.get("services", [])
@@ -331,6 +356,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--changed-files", required=True)
     parser.add_argument("--lookback-days", type=int, default=30)
+    parser.add_argument("--diff-base", default=None,
+                        help="Git ref to diff against for detecting deleted rules (e.g. origin/main)")
     parser.add_argument("--output", default="traffic-report.json")
     args = parser.parse_args()
 
@@ -380,8 +407,74 @@ def main():
                 **(result or {"traffic_found": False, "reason": "PCE not configured"}),
             })
 
-    justified = sum(1 for e in evidence if e.get("traffic_found"))
-    total = len(evidence)
+    # ── Deletion impact: query allowed traffic for deleted rules ─────────────
+    if args.diff_base:
+        for filepath in files:
+            base_data = _get_base_data(filepath, args.diff_base)
+            if not base_data:
+                continue
+            current_data: dict = {}
+            if os.path.exists(filepath):
+                try:
+                    with open(filepath) as f:
+                        current_data = yaml.safe_load(f) or {}
+                except Exception:
+                    pass
+
+            deleted = _diff_rules(base_data, current_data)
+            if not deleted:
+                continue
+
+            ruleset_name = base_data.get("name") or os.path.splitext(os.path.basename(filepath))[0]
+            scope_labels: dict = {}
+            for scope_entry in base_data.get("scopes", []):
+                for item in scope_entry:
+                    if isinstance(item, dict) and "label" in item:
+                        lbl = item["label"]
+                        if isinstance(lbl, dict):
+                            scope_labels.update(lbl)
+            scope_cfg = get_scope_config(config, scope_labels)
+
+            for rule in base_data.get("rules", []):
+                if not isinstance(rule, dict):
+                    continue
+                name = rule.get("name", "(unnamed)")
+                if deleted.get(name) != "deleted":
+                    continue
+
+                rule_entry = {
+                    "file": filepath,
+                    "ruleset_name": ruleset_name,
+                    "name": name,
+                    "consumers": rule.get("consumers", []),
+                    "providers": rule.get("providers", []),
+                    "services": rule.get("services", []),
+                    "scope_labels": scope_labels,
+                }
+                result = query_traffic_for_rule(
+                    pce, rule_entry, scope_cfg, config, service_port_map,
+                    policy_decisions=["allowed"],
+                ) or {"traffic_found": False, "reason": "PCE not configured"}
+
+                # Rename blocked_connections → allowed_connections for clarity
+                if "blocked_connections" in result:
+                    result = {**result, "allowed_connections": result.pop("blocked_connections")}
+
+                resolved_ports = _resolve_ports(rule.get("services", []), service_port_map, set())
+                evidence.append({
+                    "file": filepath,
+                    "ruleset_name": ruleset_name,
+                    "rule_name": name,
+                    "ports": resolved_ports,
+                    "is_deletion_impact": True,
+                    **result,
+                })
+                print(f"  Deletion impact [{name}]: "
+                      f"{'%d allowed connections' % result.get('allowed_connections', 0) if result.get('traffic_found') else 'no active traffic'}")
+
+    current_evidence = [e for e in evidence if not e.get("is_deletion_impact")]
+    justified = sum(1 for e in current_evidence if e.get("traffic_found"))
+    total = len(current_evidence)
 
     report = {
         "evidence": evidence,
