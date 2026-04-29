@@ -1,0 +1,7 @@
+name: "Any (0.0.0.0/0 and ::/0)"
+description: "All IPv4 and IPv6 addresses — use sparingly"
+ip_ranges:
+  - from_ip: "0.0.0.0/0"
+    description: "All IPv4"
+  - from_ip: "::/0"
+    description: "All IPv6"

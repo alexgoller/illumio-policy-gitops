@@ -1,0 +1,9 @@
+name: Kerberos
+description: "Kerberos authentication (TCP + UDP)"
+service_ports:
+  - port: 88
+    proto: tcp
+  - port: 88
+    proto: udp
+  - port: 464
+    proto: tcp

@@ -1,0 +1,9 @@
+name: RFC1918
+description: "Private IPv4 address ranges per RFC 1918"
+ip_ranges:
+  - from_ip: "10.0.0.0/8"
+    description: "Class A private"
+  - from_ip: "172.16.0.0/12"
+    description: "Class B private"
+  - from_ip: "192.168.0.0/16"
+    description: "Class C private"

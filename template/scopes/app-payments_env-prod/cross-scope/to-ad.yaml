@@ -1,0 +1,29 @@
+name: payments-to-ad
+description: "Payments processing workloads authenticate against production Active Directory"
+type: extra-scope
+enabled: true
+
+requester:
+  scope: payments-prod
+  consumers:
+    - label: {role: processing}
+
+target:
+  scope: ad-prod
+  providers:
+    - label: {role: dc}
+
+services:
+  - {port: 88, proto: tcp}     # Kerberos
+  - {port: 88, proto: udp}
+  - {port: 389, proto: tcp}    # LDAP
+  - {port: 636, proto: tcp}    # LDAPS (preferred)
+  - {port: 464, proto: tcp}    # kpasswd
+
+justification: >
+  Payment processing workloads use Kerberos authentication for service accounts
+  and LDAP to validate group membership for PCI-DSS role enforcement.
+  LDAPS (636) is required; plaintext LDAP (389) is used only for initial
+  configuration discovery and will be removed after migration is complete.
+requested_by: alice@example.com
+requested_date: "2026-04-15"

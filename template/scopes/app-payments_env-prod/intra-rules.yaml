@@ -1,0 +1,66 @@
+name: payments-prod-intra
+description: "Payments production — intra-scope rules"
+enabled: true
+
+scopes:
+  - - label: {app: payments}
+    - label: {env: prod}
+
+rules:
+  # Load balancer to web tier
+  - name: lb-to-web
+    description: "Load balancer forwards HTTPS to web tier"
+    enabled: true
+    consumers:
+      - label: {role: lb}
+    providers:
+      - label: {role: web}
+    services:
+      - {port: 8443, proto: tcp}
+
+  # Web tier to processing tier
+  - name: web-to-processing
+    description: "Web tier submits transactions to processing tier"
+    enabled: true
+    consumers:
+      - label: {role: web}
+    providers:
+      - label: {role: processing}
+    services:
+      - {port: 8080, proto: tcp}
+
+  # Processing tier to database
+  - name: processing-to-db
+    description: "Processing tier reads/writes transaction records"
+    enabled: true
+    consumers:
+      - label: {role: processing}
+    providers:
+      - label: {role: db}
+    services:
+      - {port: 5432, proto: tcp}
+
+  # Internal health checks
+  - name: healthcheck
+    description: "Internal health check probes"
+    enabled: true
+    consumers:
+      - label: {role: lb}
+    providers:
+      - label: {role: web}
+      - label: {role: processing}
+    services:
+      - {port: 8888, proto: tcp}
+
+deny_rules:
+  # Prevent database tier from ever initiating connections to the web tier
+  - name: deny-db-to-web
+    description: "Database must not initiate connections to web tier (lateral movement prevention)"
+    type: deny
+    enabled: true
+    consumers:
+      - label: {role: db}
+    providers:
+      - label: {role: web}
+    services:
+      - name: All Services

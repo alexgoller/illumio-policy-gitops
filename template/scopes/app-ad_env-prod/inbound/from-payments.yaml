@@ -1,0 +1,38 @@
+name: ad-prod-inbound-from-payments
+description: "Inbound from payments scope — AD authentication for payment processing workloads"
+type: extra-scope
+enabled: true
+
+scopes:
+  - - label: {app: ad}
+    - label: {env: prod}
+
+rules:
+  # Kerberos authentication — payment processing workloads authenticate against AD
+  - name: payments-kerberos
+    description: "Kerberos authentication for payments workloads"
+    enabled: true
+    unscoped_consumers: true
+    consumers:
+      - label: {app: payments}
+      - label: {role: processing}
+    providers:
+      - label: {role: dc}
+    services:
+      - {port: 88, proto: tcp}     # Kerberos
+      - {port: 88, proto: udp}
+      - {port: 464, proto: tcp}    # kpasswd (password changes)
+
+  # LDAP queries — payments app queries AD for service account validation
+  - name: payments-ldap
+    description: "LDAP directory lookups from payment processing"
+    enabled: true
+    unscoped_consumers: true
+    consumers:
+      - label: {app: payments}
+      - label: {role: processing}
+    providers:
+      - label: {role: dc}
+    services:
+      - {port: 389, proto: tcp}    # LDAP
+      - {port: 636, proto: tcp}    # LDAPS (preferred)

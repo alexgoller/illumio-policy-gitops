@@ -1,0 +1,5 @@
+name: PostgreSQL
+description: "PostgreSQL database server"
+service_ports:
+  - port: 5432
+    proto: tcp
