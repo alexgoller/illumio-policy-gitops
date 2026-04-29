@@ -90,10 +90,21 @@ jobs:
             }
 
             const ok = process.env.PROVISION_OUTCOME === 'success';
-            const statusIcon = ok ? '✅' : '❌';
-            const statusText = ok
-              ? (report.provisioned_to_active ? 'Provisioned to PCE active policy' : 'Draft updated — not yet active')
-              : 'Provision failed';
+            const totalChanges = (report.created || 0) + (report.updated || 0) + (report.deleted || 0);
+            let statusIcon, statusText;
+            if (!ok) {
+              statusIcon = '❌';
+              statusText = 'Provision failed';
+            } else if (totalChanges === 0) {
+              statusIcon = 'ℹ️';
+              statusText = 'Policy already in sync — nothing to provision';
+            } else if (report.provisioned_to_active) {
+              statusIcon = '✅';
+              statusText = 'Provisioned to PCE active policy';
+            } else {
+              statusIcon = '⚠️';
+              statusText = 'Draft updated — pending activation';
+            }
 
             const commitMsg = context.payload.head_commit?.message?.split('\n')[0] || '';
             const shortSha = context.sha.slice(0, 7);
