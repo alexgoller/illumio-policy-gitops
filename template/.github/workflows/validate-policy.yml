@@ -9,7 +9,7 @@ on:
       - 'services/**'
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -100,6 +100,29 @@ jobs:
             --changed-files "${{ steps.changes.outputs.files }}" \
             --output policy-resolution.json
         continue-on-error: true
+
+      - name: Firewall change request
+        id: fwchange
+        if: steps.changes.outputs.count != '0'
+        run: |
+          python3 .github/scripts/fw-change-request.py \
+            --resolution policy-resolution.json \
+            --changed-files "${{ steps.changes.outputs.files }}" \
+            --diff-base origin/main \
+            --commit "${{ github.event.pull_request.head.sha }}" \
+            --pr-title "${{ github.event.pull_request.title }}" \
+            --out-dir fw-changes
+        continue-on-error: true
+
+      - name: Commit firewall change request to PR branch
+        if: steps.changes.outputs.count != '0' && steps.fwchange.outcome == 'success'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add fw-changes/
+          git diff --staged --quiet || \
+            git commit -m "chore: update firewall change request [skip ci]" && \
+            git push origin HEAD:${{ github.head_ref }}
 
       - name: Render report
         if: steps.changes.outputs.count != '0'
