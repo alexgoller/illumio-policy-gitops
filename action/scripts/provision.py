@@ -32,7 +32,7 @@ def get_pce():
 
 
 def build_caches(pce):
-    """Build lookup caches for labels and services."""
+    """Build lookup caches for labels, services, and IP lists."""
     labels = pce.get("/labels").json()
     label_map = {}
     for lbl in labels:
@@ -41,7 +41,10 @@ def build_caches(pce):
     services = pce.get("/sec_policy/active/services").json()
     svc_map = {s["name"]: s["href"] for s in services}
 
-    return label_map, svc_map
+    ip_lists = pce.get("/sec_policy/active/ip_lists").json()
+    ipl_map = {ipl["name"]: ipl["href"] for ipl in ip_lists}
+
+    return label_map, svc_map, ipl_map
 
 
 def resolve_label(lbl_dict, label_map):
@@ -52,12 +55,23 @@ def resolve_label(lbl_dict, label_map):
     return None
 
 
-def resolve_actor(actor, label_map):
+def resolve_actor(actor, label_map, ipl_map=None):
     if isinstance(actor, dict):
         if "actors" in actor:
             return actor
         if "label" in actor:
             return resolve_label(actor["label"], label_map)
+        if "ip_list" in actor:
+            ipl = actor["ip_list"]
+            if isinstance(ipl, dict):
+                if "href" in ipl:
+                    return {"ip_list": {"href": ipl["href"]}}
+                if "name" in ipl and ipl_map:
+                    href = ipl_map.get(ipl["name"])
+                    if href:
+                        return {"ip_list": {"href": href}}
+                    print(f"    Warning: IP list '{ipl['name']}' not found in PCE — skipping actor")
+                    return None
     return actor
 
 
@@ -71,7 +85,29 @@ def resolve_service(svc, svc_map):
     return svc
 
 
-def provision_ip_list(pce, filepath, data, label_map):
+def dedup_services(services: list) -> list:
+    """Remove duplicate service entries before sending to PCE.
+
+    Two entries are considered duplicates when they share the same href
+    (named service) or the same port+proto pair (inline port).  The PCE
+    rejects rules with duplicate service references with HTTP 406.
+    """
+    seen = set()
+    result = []
+    for svc in services:
+        if not isinstance(svc, dict):
+            result.append(svc)
+            continue
+        key = svc.get("href") or (svc.get("port"), svc.get("proto"))
+        if key not in seen:
+            seen.add(key)
+            result.append(svc)
+        else:
+            print(f"    Warning: duplicate service reference removed: {svc}")
+    return result
+
+
+def provision_ip_list(pce, filepath, data, label_map, ipl_map=None):
     name = data["name"]
     body = {
         "name": name,
@@ -89,7 +125,7 @@ def provision_ip_list(pce, filepath, data, label_map):
         return "created", name
 
 
-def provision_ruleset(pce, filepath, data, label_map, svc_map):
+def provision_ruleset(pce, filepath, data, label_map, svc_map, ipl_map=None):
     name = data["name"]
 
     scopes = []
@@ -106,9 +142,9 @@ def provision_ruleset(pce, filepath, data, label_map, svc_map):
     for rule in data.get("rules", []):
         r = {
             "enabled": rule.get("enabled", True),
-            "providers": [a for a in (resolve_actor(a, label_map) for a in rule.get("providers", [])) if a],
-            "consumers": [a for a in (resolve_actor(a, label_map) for a in rule.get("consumers", [])) if a],
-            "ingress_services": [resolve_service(s, svc_map) for s in rule.get("services", [])],
+            "providers": [a for a in (resolve_actor(a, label_map, ipl_map) for a in rule.get("providers", [])) if a],
+            "consumers": [a for a in (resolve_actor(a, label_map, ipl_map) for a in rule.get("consumers", [])) if a],
+            "ingress_services": dedup_services([resolve_service(s, svc_map) for s in rule.get("services", [])]),
             "resolve_labels_as": {"providers": ["workloads"], "consumers": ["workloads"]},
         }
         if rule.get("unscoped_consumers"):
@@ -168,14 +204,22 @@ def provision_to_active(pce, description: str):
     return False
 
 
+def write_report(report: dict, path: str = "provision-report.json"):
+    import json
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2)
+
+
 def main():
     changed_raw = os.environ.get("CHANGED_FILES", "")
     if not changed_raw.strip():
         print("No changed files")
+        write_report({"status": "skipped", "created": 0, "updated": 0, "deleted": 0,
+                      "errors": [], "provisioned_to_active": False, "files": []})
         return
 
     pce = get_pce()
-    label_map, svc_map = build_caches(pce)
+    label_map, svc_map, ipl_map = build_caches(pce)
 
     files = [f.strip() for f in changed_raw.split("\n") if f.strip()]
     print(f"Processing {len(files)} changed files...")
@@ -184,6 +228,7 @@ def main():
     updated = 0
     deleted = 0
     errors = []
+    processed_files = []
 
     for filepath in files:
         if "_scope.yaml" in filepath or ".gitkeep" in filepath:
@@ -197,6 +242,7 @@ def main():
                 action, name = delete_object(pce, filepath)
                 if action == "deleted":
                     deleted += 1
+                    processed_files.append({"file": filepath, "action": "deleted", "name": name})
                     print(f"  Deleted: {name} (file removed: {filepath})")
             except Exception as e:
                 errors.append(f"DELETE {filepath}: {e}")
@@ -215,11 +261,11 @@ def main():
 
         try:
             if filepath.startswith("ip-lists/"):
-                action, name = provision_ip_list(pce, filepath, data, label_map)
+                action, name = provision_ip_list(pce, filepath, data, label_map, ipl_map)
             elif filepath.startswith("scopes/"):
                 if "rules" not in data:
                     continue
-                action, name = provision_ruleset(pce, filepath, data, label_map, svc_map)
+                action, name = provision_ruleset(pce, filepath, data, label_map, svc_map, ipl_map)
             else:
                 continue
 
@@ -227,6 +273,7 @@ def main():
                 created += 1
             elif action == "updated":
                 updated += 1
+            processed_files.append({"file": filepath, "action": action, "name": name})
             print(f"  {action.title()}: {name}")
 
         except Exception as e:
@@ -234,22 +281,54 @@ def main():
 
     total_changes = created + updated + deleted
     print(f"\nResult: {created} created, {updated} updated, {deleted} deleted, {len(errors)} errors")
+
     if errors:
         for e in errors:
             print(f"  ERROR: {e}")
+        write_report({
+            "status": "error",
+            "created": created,
+            "updated": updated,
+            "deleted": deleted,
+            "errors": errors,
+            "provisioned_to_active": False,
+            "files": processed_files,
+        })
         sys.exit(1)
 
     # Promote draft to active unless explicitly disabled.
     # AUTO_PROVISION defaults to true — the script runs on merge, which implies approval.
     auto_provision = os.environ.get("AUTO_PROVISION", "true").lower() not in ("false", "0", "no")
+    provisioned = False
     if auto_provision and total_changes > 0:
         print("\nProvisioning draft to active...")
         commit_msg = os.environ.get("PROVISION_DESCRIPTION",
                                     f"GitOps: {created} created, {updated} updated, {deleted} deleted")
-        if not provision_to_active(pce, commit_msg):
+        provisioned = provision_to_active(pce, commit_msg)
+        if not provisioned:
+            write_report({
+                "status": "error",
+                "created": created,
+                "updated": updated,
+                "deleted": deleted,
+                "errors": ["provision_to_active failed — see logs"],
+                "provisioned_to_active": False,
+                "files": processed_files,
+            })
             sys.exit(1)
     elif not auto_provision:
         print("\nAUTO_PROVISION=false — draft changes left pending for manual review")
+
+    write_report({
+        "status": "success",
+        "created": created,
+        "updated": updated,
+        "deleted": deleted,
+        "errors": [],
+        "provisioned_to_active": provisioned,
+        "auto_provision": auto_provision,
+        "files": processed_files,
+    })
 
 
 if __name__ == "__main__":
