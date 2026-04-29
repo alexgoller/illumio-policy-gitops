@@ -86,13 +86,30 @@ jobs:
             --output traffic-report.json
         continue-on-error: true
 
+      - name: Policy resolution
+        id: resolution
+        if: steps.changes.outputs.count != '0'
+        env:
+          PCE_HOST: ${{ secrets.PCE_HOST }}
+          PCE_PORT: ${{ secrets.PCE_PORT }}
+          PCE_ORG_ID: ${{ secrets.PCE_ORG_ID }}
+          PCE_API_KEY: ${{ secrets.PCE_API_KEY }}
+          PCE_API_SECRET: ${{ secrets.PCE_API_SECRET }}
+        run: |
+          python3 .github/scripts/policy-resolve.py \
+            --changed-files "${{ steps.changes.outputs.files }}" \
+            --output policy-resolution.json
+        continue-on-error: true
+
       - name: Render report
         if: steps.changes.outputs.count != '0'
         run: |
           python3 .github/scripts/render-report.py \
             --security security-report.json \
             --traffic traffic-report.json \
+            --resolution policy-resolution.json \
             --changed-files "${{ steps.changes.outputs.files }}" \
+            --diff-base origin/main \
             --output pr-comment.md
 
       - name: Post PR comment

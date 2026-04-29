@@ -236,8 +236,12 @@ def query_traffic_for_rule(pce, rule: dict, scope_cfg: dict, global_config: dict
 
     services = rule.get("services", [])
 
-    # Empty services list = "All Services" in Illumio — query all flows, no port filter.
-    all_services = not services
+    # Empty list OR [{name: All Services}] = "All Services" — query all flows, no port filter.
+    all_services = not services or (
+        len(services) == 1
+        and isinstance(services[0], dict)
+        and services[0].get("name", "").lower() in ("all services", "all")
+    )
     ports = [] if all_services else _resolve_ports(services, service_port_map or {}, exclude_ports)
 
     if not all_services and not ports:

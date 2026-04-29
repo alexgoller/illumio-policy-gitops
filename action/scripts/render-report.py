@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """
-Render a polished markdown PR comment from security and traffic reports.
+Render a polished markdown PR comment from security, traffic, and resolution reports.
 
-Reads security-report.json and traffic-report.json, then reads each changed
-YAML file to produce a per-ruleset breakdown with inline traffic evidence
-and security findings.
+Reads security-report.json, traffic-report.json, and optionally
+policy-resolution.json, then reads each changed YAML file to produce a
+per-ruleset breakdown with inline traffic evidence, security findings,
+rule-level diff markers (added/deleted/changed), and resolved IP view.
 
 Usage:
   python3 render-report.py \\
     --security security-report.json \\
     --traffic traffic-report.json \\
+    --resolution policy-resolution.json \\
     --changed-files "scopes/foo/bar.yaml\\nip-lists/baz.yaml" \\
+    --diff-base origin/main \\
     --output pr-comment.md
 """
 
 import argparse
 import json
 import os
+import subprocess
 
 import yaml
 
@@ -33,6 +37,13 @@ def _load_yaml(path: str) -> dict:
     try:
         with open(path) as f:
             return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _load_yaml_str(raw: bytes) -> dict:
+    try:
+        return yaml.safe_load(raw) or {}
     except Exception:
         return {}
 
@@ -76,15 +87,98 @@ def _fmt_evidence(ev: dict) -> tuple[str, str]:
         sources = ev.get("unique_sources", 0)
         return "✅", f"{conns:,} blocked · {sources} src"
     reason = (ev.get("reason") or ev.get("error") or "No evidence").rstrip(".")
-    # Trim long reasons
     if len(reason) > 55:
         reason = reason[:52] + "…"
     return "⚠️", reason
 
 
-def render(security_path: str, traffic_path: str, changed_files_raw: str, output_path: str):
+# ---------------------------------------------------------------------------
+# Rule diff helpers
+# ---------------------------------------------------------------------------
+
+def _get_base_data(filepath: str, diff_base: str) -> dict | None:
+    """Load YAML data for filepath at the given git ref. Returns None if not found."""
+    try:
+        raw = subprocess.check_output(
+            ["git", "show", f"{diff_base}:{filepath}"],
+            stderr=subprocess.DEVNULL,
+        )
+        return _load_yaml_str(raw)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def _rules_by_name(data: dict) -> dict[str, tuple[str, dict]]:
+    """Extract allow+deny rules indexed by name → (rule_type, rule_dict)."""
+    result = {}
+    for rule in data.get("rules", []):
+        if isinstance(rule, dict):
+            result[rule.get("name", "(unnamed)")] = ("allow", rule)
+    for rule in data.get("deny_rules", []):
+        if isinstance(rule, dict):
+            result[rule.get("name", "(unnamed)")] = ("deny", rule)
+    return result
+
+
+def _rule_fingerprint(rule: dict) -> str:
+    """Stable fingerprint for a rule dict (order-independent)."""
+    def _sort(obj):
+        if isinstance(obj, dict):
+            return {k: _sort(v) for k, v in sorted(obj.items())}
+        if isinstance(obj, list):
+            return [_sort(x) for x in obj]
+        return obj
+    return json.dumps(_sort(rule), sort_keys=True)
+
+
+def _diff_rules(base_data: dict | None, current_data: dict) -> dict[str, str]:
+    """
+    Compare base and current rule sets.
+    Returns {rule_name: "added"|"deleted"|"modified"|"unchanged"}.
+    When base_data is None (new file), all current rules are "added".
+    """
+    current_rules = _rules_by_name(current_data)
+    if base_data is None:
+        return {name: "added" for name in current_rules}
+
+    base_rules = _rules_by_name(base_data)
+    status = {}
+    for name in set(base_rules) | set(current_rules):
+        if name not in base_rules:
+            status[name] = "added"
+        elif name not in current_rules:
+            status[name] = "deleted"
+        elif _rule_fingerprint(base_rules[name][1]) != _rule_fingerprint(current_rules[name][1]):
+            status[name] = "modified"
+        else:
+            status[name] = "unchanged"
+    return status
+
+
+_DIFF_ICON = {
+    "added": "🟢",
+    "deleted": "🔴",
+    "modified": "🟡",
+    "unchanged": "",
+    "": "",
+}
+
+
+# ---------------------------------------------------------------------------
+# Main render
+# ---------------------------------------------------------------------------
+
+def render(
+    security_path: str,
+    traffic_path: str,
+    resolution_path: str,
+    changed_files_raw: str,
+    output_path: str,
+    diff_base: str | None,
+):
     security = _load_json(security_path)
     traffic = _load_json(traffic_path)
+    resolution = _load_json(resolution_path) if resolution_path else {}
 
     files = [
         f.strip() for f in changed_files_raw.split("\n")
@@ -103,6 +197,11 @@ def render(security_path: str, traffic_path: str, changed_files_raw: str, output
     evidence_index: dict[tuple, dict] = {}
     for e in traffic.get("evidence", []):
         evidence_index[(e["file"], e["rule_name"])] = e
+
+    # Index policy resolution by (file, rule_name)
+    resolution_index: dict[tuple, dict] = {}
+    for r in resolution.get("resolutions", []):
+        resolution_index[(r["file"], r["rule_name"])] = r
 
     lines = []
 
@@ -125,19 +224,44 @@ def render(security_path: str, traffic_path: str, changed_files_raw: str, output
 
     # ── Per-file sections ────────────────────────────────────────────────────
     for filepath in files:
+        is_ip_list = filepath.startswith("ip-lists/")
+        is_service = filepath.startswith("services/")
+
+        # ── Deleted file ─────────────────────────────────────────────────────
         if not os.path.exists(filepath):
-            lines.append(f"### ~~`{os.path.basename(filepath)}`~~  _(deleted)_")
+            base_name = os.path.basename(filepath)
+            lines.append(f"### ~~`{base_name}`~~  _(deleted)_")
             lines.append(f"> `{filepath}`\n")
+
+            if diff_base and not is_ip_list and not is_service:
+                base_data = _get_base_data(filepath, diff_base)
+                if base_data:
+                    base_rules_map = _rules_by_name(base_data)
+                    if base_rules_map:
+                        lines.append("| Change | Rule | Services |")
+                        lines.append("|:---:|---|---|")
+                        for name, (rtype, rule) in base_rules_map.items():
+                            svc_str = _fmt_services(rule.get("services", []))
+                            display = name if len(name) <= 72 else name[:69] + "…"
+                            type_tag = " 🚫" if rtype == "deny" else ""
+                            lines.append(f"| 🔴 | ~~{display}~~{type_tag} | {svc_str} |")
+                        lines.append("")
+
             lines.append("---\n")
             continue
 
         data = _load_yaml(filepath)
         ruleset_name = data.get("name") or os.path.splitext(os.path.basename(filepath))[0]
         file_findings = findings_by_file.get(filepath, [])
-        is_ip_list = filepath.startswith("ip-lists/")
-        is_service = filepath.startswith("services/")
 
-        # Section header: ruleset name + file path
+        # Compute rule diff
+        rule_diff: dict[str, str] = {}
+        base_data_for_diff = None
+        if diff_base:
+            base_data_for_diff = _get_base_data(filepath, diff_base)
+            rule_diff = _diff_rules(base_data_for_diff, data)
+
+        # Section header
         lines.append(f"### `{ruleset_name}`")
         lines.append(f"> `{filepath}`")
 
@@ -157,39 +281,83 @@ def render(security_path: str, traffic_path: str, changed_files_raw: str, output
         elif is_service:
             lines.append(f"> **Type:** Service object")
 
+        # ── Rule change summary ──────────────────────────────────────────────
+        if rule_diff:
+            counts = {s: sum(1 for v in rule_diff.values() if v == s)
+                      for s in ("added", "deleted", "modified", "unchanged")}
+            change_parts = []
+            if counts["added"]:
+                change_parts.append(f"🟢 {counts['added']} added")
+            if counts["deleted"]:
+                change_parts.append(f"🔴 {counts['deleted']} deleted")
+            if counts["modified"]:
+                change_parts.append(f"🟡 {counts['modified']} modified")
+            if counts["unchanged"]:
+                change_parts.append(f"{counts['unchanged']} unchanged")
+            if change_parts:
+                lines.append(f"> **Changes:** {' · '.join(change_parts)}")
+
         lines.append("")  # blank line after blockquote
 
-        # ── Rules table (rulesets) ────────────────────────────────────────
+        # ── Rules table (rulesets) ────────────────────────────────────────────
         rules = data.get("rules", [])
         deny_rules = data.get("deny_rules", [])
-        all_rules = [(r, "allow") for r in rules] + [(r, "deny") for r in deny_rules]
 
-        if all_rules:
-            lines.append("| | Rule | Services | Traffic Evidence |")
-            lines.append("|:---:|---|---|---|")
-            for rule, rule_type in all_rules:
+        # Build merged list: (rule, rule_type, diff_status)
+        current_rules: list[tuple] = (
+            [(r, "allow", rule_diff.get(r.get("name", "(unnamed)"), "")) for r in rules]
+            + [(r, "deny", rule_diff.get(r.get("name", "(unnamed)"), "")) for r in deny_rules]
+        )
+
+        # Append deleted rules from base (not present in current file)
+        if diff_base and base_data_for_diff is not None:
+            base_rules_map = _rules_by_name(base_data_for_diff)
+            current_names = {r.get("name", "(unnamed)") for r, _, _ in current_rules}
+            for name, (rtype, rule) in base_rules_map.items():
+                if rule_diff.get(name) == "deleted":
+                    current_rules.append((rule, rtype, "deleted"))
+
+        if current_rules:
+            show_diff_col = bool(rule_diff)
+            if show_diff_col:
+                lines.append("| Change | Rule | Services | Traffic Evidence |")
+                lines.append("|:---:|---|---|---|")
+            else:
+                lines.append("| | Rule | Services | Traffic Evidence |")
+                lines.append("|:---:|---|---|---|")
+
+            for rule, rule_type, diff_status in current_rules:
                 rule_name = rule.get("name", "(unnamed)")
                 services = rule.get("services", [])
                 svc_str = _fmt_services(services)
 
-                ev = evidence_index.get((filepath, rule_name))
-                icon, ev_text = _fmt_evidence(ev)
+                diff_icon = _DIFF_ICON.get(diff_status, "")
 
-                # Deny rules always get a distinct marker
+                if diff_status == "deleted":
+                    # No traffic evidence for deleted rules
+                    display_name = rule_name if len(rule_name) <= 72 else rule_name[:69] + "…"
+                    type_tag = " 🚫" if rule_type == "deny" else ""
+                    lines.append(f"| {diff_icon} | ~~{display_name}~~{type_tag} | ~~{svc_str}~~ | — |")
+                    continue
+
+                ev = evidence_index.get((filepath, rule_name))
+                ev_icon, ev_text = _fmt_evidence(ev)
+
                 if rule_type == "deny":
-                    icon = "🚫"
+                    ev_icon = "🚫"
                     ev_text = "Deny rule"
 
-                # Truncate long rule names for table readability
                 display_name = rule_name if len(rule_name) <= 72 else rule_name[:69] + "…"
-                # Mark disabled rules
                 if not rule.get("enabled", True):
                     display_name = f"~~{display_name}~~ _(disabled)_"
 
-                lines.append(f"| {icon} | {display_name} | {svc_str} | {ev_text} |")
+                # Combine ev_icon + ev_text in the evidence cell
+                ev_cell = f"{ev_icon} {ev_text}" if ev_icon not in ("—",) else ev_text
+                lines.append(f"| {diff_icon} | {display_name} | {svc_str} | {ev_cell} |")
+
             lines.append("")
 
-        # ── IP list ranges table ──────────────────────────────────────────
+        # ── IP list ranges table ──────────────────────────────────────────────
         elif is_ip_list:
             ip_ranges = data.get("ip_ranges", [])
             fqdns = data.get("fqdns", [])
@@ -217,10 +385,9 @@ def render(security_path: str, traffic_path: str, changed_files_raw: str, output
                     lines.append(f"| _… {len(fqdns) - 10} more_ |")
                 lines.append("")
 
-        # ── Service object ports table ─────────────────────────────────────
+        # ── Service object ports table ────────────────────────────────────────
         elif is_service:
             port_overrides = data.get("service_ports", [])
-            windows_services = data.get("windows_services", [])
             if port_overrides:
                 lines.append("| Port | Protocol | To Port |")
                 lines.append("|---|---|---|")
@@ -231,7 +398,42 @@ def render(security_path: str, traffic_path: str, changed_files_raw: str, output
                     lines.append(f"| {port} | {proto} | {to_port} |")
                 lines.append("")
 
-        # ── Security findings callout ─────────────────────────────────────
+        # ── Policy resolution (IP view) ──────────────────────────────────────
+        res_entries = [
+            r for r in resolution.get("resolutions", [])
+            if r.get("file") == filepath
+        ]
+        if res_entries and not is_ip_list and not is_service:
+            lines.append("<details>")
+            lines.append("<summary>🔍 Resolved Policy — IP view</summary>\n")
+            lines.append("| Rule | Consumer IPs | Provider IPs | Services |")
+            lines.append("|---|---|---|---|")
+            for r in res_entries:
+                rname = r["rule_name"]
+                if len(rname) > 50:
+                    rname = rname[:47] + "…"
+                cons = r.get("consumers", {})
+                prov = r.get("providers", {})
+
+                def _fmt_actor(a: dict) -> str:
+                    wc = a.get("workload_count", 0)
+                    ips = a.get("ips", [])
+                    ipl = a.get("ip_lists", [])
+                    if ipl:
+                        return f"IP List: {', '.join(ipl)}"
+                    if not ips:
+                        return f"{a.get('label_desc', '?')} (0 hosts)"
+                    if wc <= 3:
+                        return ", ".join(ips[:6]) + (f" +{len(ips)-6}" if len(ips) > 6 else "")
+                    return f"{', '.join(ips[:3])} … ({wc} hosts)"
+
+                lines.append(
+                    f"| {rname} | {_fmt_actor(cons)} | {_fmt_actor(prov)} | {r.get('services', '')} |"
+                )
+            lines.append("")
+            lines.append("</details>\n")
+
+        # ── Security findings callout ─────────────────────────────────────────
         if file_findings:
             for f in file_findings:
                 icon = "❌" if f["action"] == "block" else "⚠️"
@@ -273,6 +475,12 @@ def render(security_path: str, traffic_path: str, changed_files_raw: str, output
             ev_text += f" · {unjustified} need review"
         lines.append(f"| 📊 | Traffic evidence | {ev_text} |")
 
+    if resolution.get("total_workloads"):
+        lines.append(
+            f"| 🖥️ | Policy resolution | {len(resolution.get('resolutions', []))} rules resolved"
+            f" · {resolution['total_workloads']} workloads |"
+        )
+
     lines.append("")
     lines.append(
         "<sub>🤖 Generated by "
@@ -291,11 +499,21 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--security", default="security-report.json")
     parser.add_argument("--traffic", default="traffic-report.json")
+    parser.add_argument("--resolution", default=None)
     parser.add_argument("--changed-files", required=True)
+    parser.add_argument("--diff-base", default=None,
+                        help="Git ref to compare against for rule diff (e.g. origin/main)")
     parser.add_argument("--output", default="pr-comment.md")
     args = parser.parse_args()
 
-    render(args.security, args.traffic, args.changed_files, args.output)
+    render(
+        args.security,
+        args.traffic,
+        args.resolution,
+        args.changed_files,
+        args.output,
+        args.diff_base,
+    )
 
 
 if __name__ == "__main__":
