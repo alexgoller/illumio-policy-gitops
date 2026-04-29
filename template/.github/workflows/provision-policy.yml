@@ -9,7 +9,8 @@ on:
       - 'services/**'
 
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 jobs:
   provision:
@@ -40,7 +41,8 @@ jobs:
         if: steps.changes.outputs.count != '0'
         run: pip install illumio pyyaml
 
-      - name: Provision to PCE draft
+      - name: Provision to PCE
+        id: provision
         if: steps.changes.outputs.count != '0'
         env:
           PCE_HOST: ${{ secrets.PCE_HOST }}
@@ -55,7 +57,111 @@ jobs:
           # Set to "false" to leave changes in draft for manual review.
           AUTO_PROVISION: "true"
         run: python3 .github/scripts/provision.py
+        continue-on-error: true
 
-      - name: Summary
-        if: always()
-        run: echo "Provision complete — check PCE active policy"
+      - name: Post provision comment on merged PR
+        if: steps.changes.outputs.count != '0'
+        uses: actions/github-script@v7
+        env:
+          PROVISION_OUTCOME: ${{ steps.provision.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            // Find the PR that was merged to trigger this push
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+            });
+
+            if (!prs.length) {
+              console.log('No PR found for commit ' + context.sha + ' — skipping comment');
+              return;
+            }
+            const pr = prs[0];
+
+            // Read the structured report written by provision.py
+            let report = {};
+            try {
+              report = JSON.parse(fs.readFileSync('provision-report.json', 'utf8'));
+            } catch (e) {
+              console.log('provision-report.json not found, using outcome only');
+            }
+
+            const ok = process.env.PROVISION_OUTCOME === 'success';
+            const statusIcon = ok ? '✅' : '❌';
+            const statusText = ok
+              ? (report.provisioned_to_active ? 'Provisioned to PCE active policy' : 'Draft updated — not yet active')
+              : 'Provision failed';
+
+            const commitMsg = context.payload.head_commit?.message?.split('\n')[0] || '';
+            const shortSha = context.sha.slice(0, 7);
+
+            const lines = [
+              '## 🚀 Provision Status\n',
+              `**${statusIcon} ${statusText}**\n`,
+              '| | | |',
+              '|:---:|---|---|',
+              `| ${statusIcon} | Status | ${statusText} |`,
+              `| 📝 | Commit | \`${shortSha}\` ${commitMsg} |`,
+            ];
+
+            if (report.created !== undefined) {
+              if (report.created)  lines.push(`| ➕ | Created  | ${report.created} |`);
+              if (report.updated)  lines.push(`| ✏️ | Updated  | ${report.updated} |`);
+              if (report.deleted)  lines.push(`| 🗑️ | Deleted  | ${report.deleted} |`);
+            }
+
+            if (report.files && report.files.length) {
+              lines.push('');
+              lines.push('**Files provisioned:**');
+              for (const f of report.files) {
+                const icon = f.action === 'created' ? '➕' : f.action === 'deleted' ? '🗑️' : '✏️';
+                lines.push(`> ${icon} \`${f.file}\` — ${f.name}`);
+              }
+            }
+
+            if (report.errors && report.errors.length) {
+              lines.push('');
+              lines.push('**Errors:**');
+              for (const e of report.errors.slice(0, 10)) {
+                lines.push('> `' + e + '`');
+              }
+            }
+
+            lines.push('');
+            lines.push(
+              '<sub>🤖 [Illumio Policy GitOps](https://github.com/alexgoller/illumio-policy-gitops) · ' +
+              `[Run #${context.runNumber}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})</sub>`
+            );
+
+            const body = lines.join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              body,
+            });
+
+            console.log(`Posted provision status on PR #${pr.number}`);
+
+      - name: Update README badges
+        if: steps.changes.outputs.count != '0'
+        run: |
+          python3 .github/scripts/update-badges.py \
+            --report provision-report.json \
+            --readme README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --staged --quiet || \
+            git commit -m "chore: update policy badges [skip ci]" && \
+            git push
+
+      - name: Fail if provision errored
+        if: steps.provision.outcome == 'failure'
+        run: |
+          echo "Provision step failed — see logs above"
+          exit 1
