@@ -15,7 +15,7 @@ Illumio PCE has a robust draft/active policy model and an event log that records
 - **No peer review gate.** Any engineer with API access can create a rule and provision it to active.
 - **No cross-team coordination.** Team A can write rules into Team B's scope without Team B knowing.
 - **Incomplete audit trail.** PCE events show *who clicked provision*, not *who reviewed and approved*.
-- **No rollback mechanism.** Reverting a bad rule means manual GUI edits under pressure.
+- **No cross-tool change linkage.** PCE has full policy versioning and rollback, but those versions aren't linked to the ticket, Slack thread, or email that authorized the change.
 - **GUI changes bypass everything.** Engineers editing directly in the PCE bypass any process you build.
 
 This project closes those gaps by treating segmentation policy as code — version-controlled, peer-reviewed, automatically validated, and deployed through a repeatable pipeline.
@@ -25,49 +25,35 @@ This project closes those gaps by treating segmentation policy as code — versi
 ## Two Components, One Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         ILLUMIO PCE                                     │
-│                    (Draft / Active Policy)                               │
-└───────────────┬─────────────────────────────────────────┬───────────────┘
-                │  Export (PCE → Git)                      │  Provision (Git → PCE)
-                ▼                                          │
-┌───────────────────────────────┐                          │
-│     POLICY GITOPS PLUGIN      │──── pulls from ──────────┘
-│   (plugger daemon container)  │
-└───────────────────────────────┘
-                │  commits YAML
-                ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        POLICY REPOSITORY (Git)                          │
-│                                                                         │
-│  scopes/                  ip-lists/          services/                  │
-│  ├── _global/             ├── rfc1918.yaml    ├── postgresql.yaml       │
-│  ├── app-payments_env-prod/  └── zscaler.yaml └── https.yaml           │
-│  │   ├── _scope.yaml                                                    │
-│  │   ├── intra-rules.yaml                                               │
-│  │   └── cross-scope/to-shareddb.yaml                                  │
-│  └── app-shareddb_env-prod/                                             │
-│      ├── _scope.yaml                                                    │
-│      └── inbound/from-payments.yaml                                     │
-└───────────────────────┬─────────────────────────────────────────────────┘
-                        │  Pull Request
-                        ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                      GITHUB ACTIONS PIPELINE                            │
-│                                                                         │
-│  ① YAML lint   ② Security checks (8 rules)   ③ Traffic evidence       │
-│  ④ Policy resolution   ⑤ Firewall change request   ⑥ PR comment       │
-│                                                                         │
-│  CODEOWNERS enforces: payments-team + database-team + security-team     │
-└─────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       POLICY WORKFLOW PLUGIN                            │
-│              (Optional — for ITSM-native organizations)                 │
-│                                                                         │
-│  Monitors PCE draft changes → classifies risk → routes to approvers    │
-│  Slack ·· ServiceNow ·· Jira ·· Webhooks ·· GitHub Issues             │
-└─────────────────────────────────────────────────────────────────────────┘
+  PATH A — Git-native                          PATH B — UI-native
+  (edit YAML, open PR)                         (edit rules in PCE GUI)
+          │                                              │
+          ▼                                              ▼
+┌──────────────────────┐              ┌─────────────────────────────────┐
+│   POLICY REPOSITORY  │              │           ILLUMIO PCE           │
+│        (Git)         │              │    (Draft Policy — versioned)   │
+│                      │              └──────────────┬──────────────────┘
+│  scopes/             │                             │
+│  ip-lists/           │◄── Export (PCE → Git) ──────┤  POLICY GITOPS PLUGIN
+│  services/           │                             │  (plugger daemon)
+│                      │─── Provision (Git → PCE) ──►│
+└──────────┬───────────┘                             │
+           │  Pull Request                            │  POLICY WORKFLOW PLUGIN
+           ▼                                          │  detects draft changes
+┌──────────────────────────────────────┐             │  classifies risk
+│       GITHUB ACTIONS PIPELINE        │             │  routes to approvers
+│                                      │             ▼
+│  ① YAML lint                         │  ┌─────────────────────────────┐
+│  ② Security checks (8 rules)         │  │  APPROVAL ADAPTERS          │
+│  ③ Traffic evidence (PCE Explorer)   │  │  Slack · ServiceNow · Jira  │
+│  ④ Policy resolution                 │  │  Webhooks · GitHub Issues   │
+│  ⑤ Firewall change request           │  └──────────────┬──────────────┘
+│  ⑥ PR comment                        │                 │  approved
+│                                      │                 ▼
+│  CODEOWNERS enforces team reviews    │  ┌─────────────────────────────┐
+└──────────────────────────────────────┘  │  PCE Active Policy          │
+           │  merge                        │  (provisioned on approval)  │
+           └──────────────────────────────►└─────────────────────────────┘
 ```
 
 ### Component 1 — Policy GitOps
