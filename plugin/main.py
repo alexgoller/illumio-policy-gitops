@@ -176,30 +176,45 @@ class PolicySerializer:
             log.warning("Failed to fetch labels: %s", e)
 
     def refresh_service_cache(self):
-        """Fetch all services from PCE and cache href -> service mapping."""
-        try:
-            resp = self.pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/services")
-            if resp.status_code == 200:
-                for svc in resp.json():
-                    href = svc.get("href", "")
-                    if href:
-                        self._service_cache[href] = svc
-                log.info("Cached %d services", len(self._service_cache))
-        except Exception as e:
-            log.warning("Failed to fetch services: %s", e)
+        """Fetch services from both active and draft policy scopes.
+
+        New draft rulesets (update_type=create) may reference services that
+        only exist in draft. Merging both scopes ensures all hrefs resolve
+        regardless of which scope the ruleset was fetched from.
+        Active is loaded first so draft names win on collision (draft is more
+        current).
+        """
+        scopes_to_try = ["active", "draft"] if EXPORT_POLICY_SCOPE == "draft" else [EXPORT_POLICY_SCOPE, "draft"]
+        for scope in scopes_to_try:
+            try:
+                resp = self.pce.get(f"/sec_policy/{scope}/services")
+                if resp.status_code == 200:
+                    for svc in resp.json():
+                        href = svc.get("href", "")
+                        if href:
+                            self._service_cache[href] = svc
+            except Exception as e:
+                log.warning("Failed to fetch services from %s scope: %s", scope, e)
+        log.info("Cached %d services (active+draft merged)", len(self._service_cache))
 
     def refresh_ip_list_cache(self):
-        """Fetch all IP lists from PCE and cache href -> ip_list mapping."""
-        try:
-            resp = self.pce.get(f"/sec_policy/{EXPORT_POLICY_SCOPE}/ip_lists")
-            if resp.status_code == 200:
-                for ipl in resp.json():
-                    href = ipl.get("href", "")
-                    if href:
-                        self._ip_list_cache[href] = ipl
-                log.info("Cached %d IP lists", len(self._ip_list_cache))
-        except Exception as e:
-            log.warning("Failed to fetch IP lists: %s", e)
+        """Fetch IP lists from both active and draft policy scopes.
+
+        Same rationale as refresh_service_cache — new draft rulesets may
+        reference IP lists that only exist in draft.
+        """
+        scopes_to_try = ["active", "draft"] if EXPORT_POLICY_SCOPE == "draft" else [EXPORT_POLICY_SCOPE, "draft"]
+        for scope in scopes_to_try:
+            try:
+                resp = self.pce.get(f"/sec_policy/{scope}/ip_lists")
+                if resp.status_code == 200:
+                    for ipl in resp.json():
+                        href = ipl.get("href", "")
+                        if href:
+                            self._ip_list_cache[href] = ipl
+            except Exception as e:
+                log.warning("Failed to fetch IP lists from %s scope: %s", scope, e)
+        log.info("Cached %d IP lists (active+draft merged)", len(self._ip_list_cache))
 
     def refresh_label_group_cache(self):
         """Fetch all label groups from PCE and cache href -> label_group mapping."""
@@ -1712,24 +1727,30 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
                 log.info("Fetched %d rulesets from PCE", len(rulesets))
 
                 for rs in rulesets:
-                    if rs.get("update_type") == "delete":
-                        log.info("Skipping ruleset '%s' (pending deletion in PCE draft)", rs.get("name"))
+                    rs_name = rs.get("name", "unnamed")
+                    update_type = rs.get("update_type")
+                    if update_type == "delete":
+                        log.info("Skipping ruleset '%s' (pending deletion in PCE draft)", rs_name)
                         continue
-                    yaml_data = serializer.export_ruleset_to_yaml(rs)
-                    directory = scope_mapper.map_ruleset_to_directory(rs)
-                    dir_path = repo_dir / directory
-                    dir_path.mkdir(parents=True, exist_ok=True)
+                    try:
+                        log.debug("Exporting ruleset '%s' (update_type=%s)", rs_name, update_type or "null")
+                        yaml_data = serializer.export_ruleset_to_yaml(rs)
+                        directory = scope_mapper.map_ruleset_to_directory(rs)
+                        dir_path = repo_dir / directory
+                        dir_path.mkdir(parents=True, exist_ok=True)
 
-                    filename = _sanitize_filename(rs.get("name", "unnamed")) + ".yaml"
-                    file_path = dir_path / filename
+                        filename = _sanitize_filename(rs_name) + ".yaml"
+                        file_path = dir_path / filename
 
-                    yaml_content = yaml.dump(
-                        yaml_data, default_flow_style=False,
-                        sort_keys=False, allow_unicode=True,
-                    )
-                    file_path.write_text(yaml_content)
-                    changed_files.append(str(file_path.relative_to(repo_dir)))
-                    counts["rulesets"] += 1
+                        yaml_content = yaml.dump(
+                            yaml_data, default_flow_style=False,
+                            sort_keys=False, allow_unicode=True,
+                        )
+                        file_path.write_text(yaml_content)
+                        changed_files.append(str(file_path.relative_to(repo_dir)))
+                        counts["rulesets"] += 1
+                    except Exception as rs_err:
+                        log.error("Failed to export ruleset '%s': %s", rs_name, rs_err)
 
                     # Write _scope.yaml for non-global scope directories
                     if directory != "scopes/_global":
@@ -1771,20 +1792,24 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
                 ip_lists_dir.mkdir(parents=True, exist_ok=True)
 
                 for ipl in ip_lists:
+                    ipl_name = ipl.get("name", "unnamed")
                     if ipl.get("update_type") == "delete":
-                        log.info("Skipping IP list '%s' (pending deletion in PCE draft)", ipl.get("name"))
+                        log.info("Skipping IP list '%s' (pending deletion in PCE draft)", ipl_name)
                         continue
-                    yaml_data = serializer.export_ip_list_to_yaml(ipl)
-                    filename = _sanitize_filename(ipl.get("name", "unnamed")) + ".yaml"
-                    file_path = ip_lists_dir / filename
+                    try:
+                        yaml_data = serializer.export_ip_list_to_yaml(ipl)
+                        filename = _sanitize_filename(ipl_name) + ".yaml"
+                        file_path = ip_lists_dir / filename
 
-                    yaml_content = yaml.dump(
-                        yaml_data, default_flow_style=False,
-                        sort_keys=False, allow_unicode=True,
-                    )
-                    file_path.write_text(yaml_content)
-                    changed_files.append(str(file_path.relative_to(repo_dir)))
-                    counts["ip_lists"] += 1
+                        yaml_content = yaml.dump(
+                            yaml_data, default_flow_style=False,
+                            sort_keys=False, allow_unicode=True,
+                        )
+                        file_path.write_text(yaml_content)
+                        changed_files.append(str(file_path.relative_to(repo_dir)))
+                        counts["ip_lists"] += 1
+                    except Exception as ipl_err:
+                        log.error("Failed to export IP list '%s': %s", ipl_name, ipl_err)
             else:
                 log.error("Failed to fetch IP lists: HTTP %d", resp.status_code)
         except Exception as e:
@@ -1803,20 +1828,24 @@ def run_export(pce: PolicyComputeEngine, serializer: PolicySerializer,
                 services_dir.mkdir(parents=True, exist_ok=True)
 
                 for svc in services:
+                    svc_name = svc.get("name", "unnamed")
                     if svc.get("update_type") == "delete":
-                        log.info("Skipping service '%s' (pending deletion in PCE draft)", svc.get("name"))
+                        log.info("Skipping service '%s' (pending deletion in PCE draft)", svc_name)
                         continue
-                    yaml_data = serializer.export_service_to_yaml(svc)
-                    filename = _sanitize_filename(svc.get("name", "unnamed")) + ".yaml"
-                    file_path = services_dir / filename
+                    try:
+                        yaml_data = serializer.export_service_to_yaml(svc)
+                        filename = _sanitize_filename(svc_name) + ".yaml"
+                        file_path = services_dir / filename
 
-                    yaml_content = yaml.dump(
-                        yaml_data, default_flow_style=False,
-                        sort_keys=False, allow_unicode=True,
-                    )
-                    file_path.write_text(yaml_content)
-                    changed_files.append(str(file_path.relative_to(repo_dir)))
-                    counts["services"] += 1
+                        yaml_content = yaml.dump(
+                            yaml_data, default_flow_style=False,
+                            sort_keys=False, allow_unicode=True,
+                        )
+                        file_path.write_text(yaml_content)
+                        changed_files.append(str(file_path.relative_to(repo_dir)))
+                        counts["services"] += 1
+                    except Exception as svc_err:
+                        log.error("Failed to export service '%s': %s", svc_name, svc_err)
             else:
                 log.error("Failed to fetch services: HTTP %d", resp.status_code)
         except Exception as e:
