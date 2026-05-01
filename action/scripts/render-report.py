@@ -215,10 +215,14 @@ def render(
     changed_files_raw: str,
     output_path: str,
     diff_base: str | None,
+    label_check_path: str | None = None,
+    mirror_check_path: str | None = None,
 ):
     security = _load_json(security_path)
     traffic = _load_json(traffic_path)
     resolution = _load_json(resolution_path) if resolution_path else {}
+    label_check = _load_json(label_check_path) if label_check_path else {}
+    mirror_check = _load_json(mirror_check_path) if mirror_check_path else {}
 
     files = [
         f.strip() for f in changed_files_raw.split("\n")
@@ -227,6 +231,28 @@ def render(
 
     ss = security.get("summary", {})
     ts = traffic.get("summary", {})
+
+    # Index blast radius warnings by (file, rule_name)
+    blast_index: dict[tuple, dict] = {}
+    for w in resolution.get("blast_radius_warnings", []):
+        blast_index[(w["file"], w["rule_name"])] = w
+
+    # Index label check issues:
+    #   label_rule_index[(file, rule_name)] = ["key=value", ...]  (for inline table flags)
+    #   label_file_issues[file] = [{"label_key", "label_value", "context"}, ...]  (for callout)
+    label_rule_index: dict[tuple, list[str]] = {}
+    label_file_issues: dict[str, list[dict]] = {}
+    for m in label_check.get("missing", []):
+        filepath_m = m["file"]
+        label_file_issues.setdefault(filepath_m, []).append(m)
+        # Parse context: "rules.rule-name.consumers" or "deny_rules.rule-name.providers"
+        ctx_parts = m.get("context", "").split(".")
+        if len(ctx_parts) >= 2 and ctx_parts[0] in ("rules", "deny_rules"):
+            rule_name_m = ".".join(ctx_parts[1:-1]) if len(ctx_parts) > 2 else ctx_parts[1]
+            key = (filepath_m, rule_name_m)
+            label_rule_index.setdefault(key, []).append(
+                f"`{m['label_key']}={m['label_value']}`"
+            )
 
     # Index security findings by file
     findings_by_file: dict[str, list] = {}
@@ -250,8 +276,12 @@ def render(
 
     badge_parts = []
 
-    # PR status
-    if ss.get("blocked"):
+    # PR status — include label/mirror/blast blocks
+    lc_missing = len(label_check.get("missing", []))
+    mc_missing = len(mirror_check.get("missing", []))
+    br_blocked = resolution.get("has_blast_block", False)
+    any_blocked = ss.get("blocked") or lc_missing or mc_missing or br_blocked
+    if any_blocked:
         badge_parts.append(_badge("PR", "BLOCKED", "critical"))
     else:
         badge_parts.append(_badge("PR", "clear to merge", "success"))
@@ -285,6 +315,20 @@ def render(
     if total_rules:
         t_color = "success" if justified == total_rules else ("yellow" if justified > 0 else "orange")
         badge_parts.append(_badge("traffic", f"{justified}/{total_rules} justified", t_color))
+
+    # Label check
+    if not label_check.get("skipped"):
+        if lc_missing:
+            badge_parts.append(_badge("labels", f"{lc_missing} missing", "critical"))
+        else:
+            badge_parts.append(_badge("labels", "all valid", "success"))
+
+    # Mirror check
+    if not mirror_check.get("skipped", True):
+        if mc_missing:
+            badge_parts.append(_badge("mirrors", f"{mc_missing} missing", "critical"))
+        else:
+            badge_parts.append(_badge("mirrors", "paired", "success"))
 
     # ── Header ──────────────────────────────────────────────────────────────
     lines.append("## 🔒 Policy Change Report\n")
@@ -420,6 +464,18 @@ def render(
                 if not rule.get("enabled", True):
                     display_name = f"~~{display_name}~~ _(disabled)_"
 
+                # Blast radius inline flag
+                br = blast_index.get((filepath, rule_name))
+                if br:
+                    br_icon = "🔴" if br["level"] == "block" else "⚠️"
+                    display_name = f"{display_name} {br_icon} _{br['blast_radius']} workloads_"
+
+                # Missing label inline flag — rule will silently match zero workloads
+                missing_labels = label_rule_index.get((filepath, rule_name))
+                if missing_labels:
+                    labels_str = ", ".join(missing_labels)
+                    display_name = f"{display_name} ❌ _missing label: {labels_str}_"
+
                 # Combine ev_icon + ev_text in the evidence cell
                 ev_cell = f"{ev_icon} {ev_text}" if ev_icon not in ("—",) else ev_text
                 lines.append(f"| {diff_icon} | {display_name} | {svc_str} | {ev_cell} |")
@@ -516,12 +572,49 @@ def render(
                 lines.append(f"> {icon} **{f['rule_id']}** `{f['severity']}` — {f['message']}{pr_impact}{ctx}")
             lines.append("")
 
+        # ── Missing label callout ─────────────────────────────────────────────
+        file_label_missing = label_file_issues.get(filepath, [])
+        if file_label_missing:
+            lines.append("> **❌ Label validation failed — blocks this PR**")
+            lines.append(">")
+            lines.append("> Rules referencing labels that do not exist in PCE will silently match")
+            lines.append("> **zero workloads** — the policy looks valid but enforces nothing.")
+            lines.append(">")
+            lines.append("> | Label | Context | Action |")
+            lines.append("> |---|---|---|")
+            for m in file_label_missing:
+                ctx_parts = m.get("context", "").split(".")
+                if len(ctx_parts) >= 3 and ctx_parts[0] in ("rules", "deny_rules"):
+                    rule_ref = ".".join(ctx_parts[1:-1])
+                    field = ctx_parts[-1]
+                    ctx_str = f"rule `{rule_ref}` → {field}"
+                elif ctx_parts[0] == "scopes":
+                    ctx_str = "scope constraint"
+                else:
+                    ctx_str = m.get("context", "")
+                lines.append(
+                    f"> | `{m['label_key']}={m['label_value']}` | {ctx_str} |"
+                    f" Create label or fix typo |"
+                )
+            lines.append("")
+
         lines.append("---\n")
 
     # ── Footer summary table ─────────────────────────────────────────────────
     lines.append("### Summary\n")
-    status_icon = "❌" if ss.get("blocked") else "✅"
-    status_text = "**BLOCKED** — critical findings detected, this PR cannot merge" if ss.get("blocked") else "Clear to merge"
+    block_reasons = []
+    if ss.get("blocked"):
+        block_reasons.append("critical security findings")
+    if lc_missing:
+        block_reasons.append(f"{lc_missing} missing label(s)")
+    if mc_missing:
+        block_reasons.append(f"{mc_missing} missing mirror file(s)")
+    if br_blocked:
+        block_reasons.append("blast radius exceeded")
+    status_icon = "❌" if block_reasons else "✅"
+    status_text = (
+        f"**BLOCKED** — {', '.join(block_reasons)}" if block_reasons else "Clear to merge"
+    )
 
     lines.append("| | | |")
     lines.append("|:---:|---|---|")
@@ -556,6 +649,45 @@ def render(
             f"| 🖥️ | Policy resolution | {len(resolution.get('resolutions', []))} rules resolved"
             f" · {resolution['total_workloads']} workloads |"
         )
+
+    # Label check
+    if not label_check.get("skipped"):
+        files_checked = label_check.get("files_checked", 0)
+        pce_total = label_check.get("total_labels_in_pce", 0)
+        pce_str = f" · PCE has {pce_total:,} labels" if pce_total else ""
+        if lc_missing:
+            affected_files = len({m["file"] for m in label_check.get("missing", [])})
+            lines.append(
+                f"| ❌ | Label validation | {lc_missing} missing ref(s) across {affected_files} file(s)"
+                f" — **blocks this PR**{pce_str} |"
+            )
+        else:
+            lines.append(
+                f"| ✅ | Label validation | All references valid · {files_checked} file(s) checked{pce_str} |"
+            )
+
+    # Mirror check
+    if not mirror_check.get("skipped", True) and mirror_check.get("checked", 0) > 0:
+        if mc_missing:
+            mc_items = "; ".join(
+                f"`{m['expected_mirror']}`"
+                for m in mirror_check.get("missing", [])[:3]
+            )
+            lines.append(f"| ❌ | Cross-scope mirrors | {mc_missing} missing — **blocks this PR** · {mc_items} |")
+        else:
+            lines.append(f"| ✅ | Cross-scope mirrors | All {mirror_check['checked']} cross-scope pair(s) have mirrors |")
+
+    # Blast radius
+    br_warnings = resolution.get("blast_radius_warnings", [])
+    if br_warnings:
+        br_blocks = [w for w in br_warnings if w["level"] == "block"]
+        br_warns  = [w for w in br_warnings if w["level"] == "warn"]
+        br_parts = []
+        if br_blocks:
+            br_parts.append(f"{len(br_blocks)} blocking (>{resolution.get('blast_radius_warnings', [{}])[0].get('blast_radius', '')} workloads)")
+        if br_warns:
+            br_parts.append(f"{len(br_warns)} warning")
+        lines.append(f"| {'❌' if br_blocks else '⚠️'} | Blast radius | {' · '.join(br_parts)} |")
 
     # FW change request files — show link when they exist in the PR branch
     if os.path.exists("fw-changes/fw-change-request.csv"):
@@ -596,6 +728,8 @@ def main():
     parser.add_argument("--changed-files", required=True)
     parser.add_argument("--diff-base", default=None,
                         help="Git ref to compare against for rule diff (e.g. origin/main)")
+    parser.add_argument("--label-check", default=None)
+    parser.add_argument("--mirror-check", default=None)
     parser.add_argument("--output", default="pr-comment.md")
     args = parser.parse_args()
 
@@ -606,6 +740,8 @@ def main():
         args.changed_files,
         args.output,
         args.diff_base,
+        label_check_path=args.label_check,
+        mirror_check_path=args.mirror_check,
     )
 
 

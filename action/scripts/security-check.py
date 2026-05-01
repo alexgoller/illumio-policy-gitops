@@ -179,14 +179,7 @@ _BROAD_IP_LIST_NAMES = {"any", "all", "rfc1918", "0.0.0.0"}
 
 
 def check_broad_consumer(rule_data: dict) -> bool:
-    """SEC-008: Consumer is 'All Workloads' or a broad IP list with no role on providers.
-
-    Flags rules where:
-    - Consumer is ams (all workloads) OR an IP list whose name starts with
-      'any', 'all', 'rfc1918', or '0.0.0.0'
-    - AND none of the providers has a role label (meaning the rule reaches
-      every workload regardless of what it does)
-    """
+    """SEC-008: Consumer is 'All Workloads' or a broad IP list with no role on providers."""
     consumers = rule_data.get("consumers", [])
     providers = rule_data.get("providers", [])
 
@@ -207,13 +200,12 @@ def check_broad_consumer(rule_data: dict) -> bool:
     if not broad_consumer:
         return False
 
-    # Check if any provider has a role label — that would scope it down
     for p in providers:
         if not isinstance(p, dict):
             continue
         lbl = p.get("label", {})
         if isinstance(lbl, dict) and "role" in lbl:
-            return False  # At least one provider has a role constraint
+            return False
 
     return True
 
