@@ -237,6 +237,23 @@ def render(
     for w in resolution.get("blast_radius_warnings", []):
         blast_index[(w["file"], w["rule_name"])] = w
 
+    # Index label check issues:
+    #   label_rule_index[(file, rule_name)] = ["key=value", ...]  (for inline table flags)
+    #   label_file_issues[file] = [{"label_key", "label_value", "context"}, ...]  (for callout)
+    label_rule_index: dict[tuple, list[str]] = {}
+    label_file_issues: dict[str, list[dict]] = {}
+    for m in label_check.get("missing", []):
+        filepath_m = m["file"]
+        label_file_issues.setdefault(filepath_m, []).append(m)
+        # Parse context: "rules.rule-name.consumers" or "deny_rules.rule-name.providers"
+        ctx_parts = m.get("context", "").split(".")
+        if len(ctx_parts) >= 2 and ctx_parts[0] in ("rules", "deny_rules"):
+            rule_name_m = ".".join(ctx_parts[1:-1]) if len(ctx_parts) > 2 else ctx_parts[1]
+            key = (filepath_m, rule_name_m)
+            label_rule_index.setdefault(key, []).append(
+                f"`{m['label_key']}={m['label_value']}`"
+            )
+
     # Index security findings by file
     findings_by_file: dict[str, list] = {}
     for f in security.get("findings", []):
@@ -453,6 +470,12 @@ def render(
                     br_icon = "🔴" if br["level"] == "block" else "⚠️"
                     display_name = f"{display_name} {br_icon} _{br['blast_radius']} workloads_"
 
+                # Missing label inline flag — rule will silently match zero workloads
+                missing_labels = label_rule_index.get((filepath, rule_name))
+                if missing_labels:
+                    labels_str = ", ".join(missing_labels)
+                    display_name = f"{display_name} ❌ _missing label: {labels_str}_"
+
                 # Combine ev_icon + ev_text in the evidence cell
                 ev_cell = f"{ev_icon} {ev_text}" if ev_icon not in ("—",) else ev_text
                 lines.append(f"| {diff_icon} | {display_name} | {svc_str} | {ev_cell} |")
@@ -549,6 +572,32 @@ def render(
                 lines.append(f"> {icon} **{f['rule_id']}** `{f['severity']}` — {f['message']}{pr_impact}{ctx}")
             lines.append("")
 
+        # ── Missing label callout ─────────────────────────────────────────────
+        file_label_missing = label_file_issues.get(filepath, [])
+        if file_label_missing:
+            lines.append("> **❌ Label validation failed — blocks this PR**")
+            lines.append(">")
+            lines.append("> Rules referencing labels that do not exist in PCE will silently match")
+            lines.append("> **zero workloads** — the policy looks valid but enforces nothing.")
+            lines.append(">")
+            lines.append("> | Label | Context | Action |")
+            lines.append("> |---|---|---|")
+            for m in file_label_missing:
+                ctx_parts = m.get("context", "").split(".")
+                if len(ctx_parts) >= 3 and ctx_parts[0] in ("rules", "deny_rules"):
+                    rule_ref = ".".join(ctx_parts[1:-1])
+                    field = ctx_parts[-1]
+                    ctx_str = f"rule `{rule_ref}` → {field}"
+                elif ctx_parts[0] == "scopes":
+                    ctx_str = "scope constraint"
+                else:
+                    ctx_str = m.get("context", "")
+                lines.append(
+                    f"> | `{m['label_key']}={m['label_value']}` | {ctx_str} |"
+                    f" Create label or fix typo |"
+                )
+            lines.append("")
+
         lines.append("---\n")
 
     # ── Footer summary table ─────────────────────────────────────────────────
@@ -603,14 +652,19 @@ def render(
 
     # Label check
     if not label_check.get("skipped"):
+        files_checked = label_check.get("files_checked", 0)
+        pce_total = label_check.get("total_labels_in_pce", 0)
+        pce_str = f" · PCE has {pce_total:,} labels" if pce_total else ""
         if lc_missing:
-            lc_items = "; ".join(
-                f"`{m['label_key']}={m['label_value']}` in `{m['file']}`"
-                for m in label_check.get("missing", [])[:5]
+            affected_files = len({m["file"] for m in label_check.get("missing", [])})
+            lines.append(
+                f"| ❌ | Label validation | {lc_missing} missing ref(s) across {affected_files} file(s)"
+                f" — **blocks this PR**{pce_str} |"
             )
-            lines.append(f"| ❌ | Label validation | {len(label_check['missing'])} missing — **blocks this PR** · {lc_items} |")
         else:
-            lines.append(f"| ✅ | Label validation | All label references exist in PCE |")
+            lines.append(
+                f"| ✅ | Label validation | All references valid · {files_checked} file(s) checked{pce_str} |"
+            )
 
     # Mirror check
     if not mirror_check.get("skipped", True) and mirror_check.get("checked", 0) > 0:
