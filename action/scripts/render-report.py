@@ -215,10 +215,14 @@ def render(
     changed_files_raw: str,
     output_path: str,
     diff_base: str | None,
+    label_check_path: str | None = None,
+    mirror_check_path: str | None = None,
 ):
     security = _load_json(security_path)
     traffic = _load_json(traffic_path)
     resolution = _load_json(resolution_path) if resolution_path else {}
+    label_check = _load_json(label_check_path) if label_check_path else {}
+    mirror_check = _load_json(mirror_check_path) if mirror_check_path else {}
 
     files = [
         f.strip() for f in changed_files_raw.split("\n")
@@ -227,6 +231,11 @@ def render(
 
     ss = security.get("summary", {})
     ts = traffic.get("summary", {})
+
+    # Index blast radius warnings by (file, rule_name)
+    blast_index: dict[tuple, dict] = {}
+    for w in resolution.get("blast_radius_warnings", []):
+        blast_index[(w["file"], w["rule_name"])] = w
 
     # Index security findings by file
     findings_by_file: dict[str, list] = {}
@@ -250,8 +259,12 @@ def render(
 
     badge_parts = []
 
-    # PR status
-    if ss.get("blocked"):
+    # PR status — include label/mirror/blast blocks
+    lc_missing = len(label_check.get("missing", []))
+    mc_missing = len(mirror_check.get("missing", []))
+    br_blocked = resolution.get("has_blast_block", False)
+    any_blocked = ss.get("blocked") or lc_missing or mc_missing or br_blocked
+    if any_blocked:
         badge_parts.append(_badge("PR", "BLOCKED", "critical"))
     else:
         badge_parts.append(_badge("PR", "clear to merge", "success"))
@@ -285,6 +298,20 @@ def render(
     if total_rules:
         t_color = "success" if justified == total_rules else ("yellow" if justified > 0 else "orange")
         badge_parts.append(_badge("traffic", f"{justified}/{total_rules} justified", t_color))
+
+    # Label check
+    if not label_check.get("skipped"):
+        if lc_missing:
+            badge_parts.append(_badge("labels", f"{lc_missing} missing", "critical"))
+        else:
+            badge_parts.append(_badge("labels", "all valid", "success"))
+
+    # Mirror check
+    if not mirror_check.get("skipped", True):
+        if mc_missing:
+            badge_parts.append(_badge("mirrors", f"{mc_missing} missing", "critical"))
+        else:
+            badge_parts.append(_badge("mirrors", "paired", "success"))
 
     # ── Header ──────────────────────────────────────────────────────────────
     lines.append("## 🔒 Policy Change Report\n")
@@ -420,6 +447,12 @@ def render(
                 if not rule.get("enabled", True):
                     display_name = f"~~{display_name}~~ _(disabled)_"
 
+                # Blast radius inline flag
+                br = blast_index.get((filepath, rule_name))
+                if br:
+                    br_icon = "🔴" if br["level"] == "block" else "⚠️"
+                    display_name = f"{display_name} {br_icon} _{br['blast_radius']} workloads_"
+
                 # Combine ev_icon + ev_text in the evidence cell
                 ev_cell = f"{ev_icon} {ev_text}" if ev_icon not in ("—",) else ev_text
                 lines.append(f"| {diff_icon} | {display_name} | {svc_str} | {ev_cell} |")
@@ -520,8 +553,19 @@ def render(
 
     # ── Footer summary table ─────────────────────────────────────────────────
     lines.append("### Summary\n")
-    status_icon = "❌" if ss.get("blocked") else "✅"
-    status_text = "**BLOCKED** — critical findings detected, this PR cannot merge" if ss.get("blocked") else "Clear to merge"
+    block_reasons = []
+    if ss.get("blocked"):
+        block_reasons.append("critical security findings")
+    if lc_missing:
+        block_reasons.append(f"{lc_missing} missing label(s)")
+    if mc_missing:
+        block_reasons.append(f"{mc_missing} missing mirror file(s)")
+    if br_blocked:
+        block_reasons.append("blast radius exceeded")
+    status_icon = "❌" if block_reasons else "✅"
+    status_text = (
+        f"**BLOCKED** — {', '.join(block_reasons)}" if block_reasons else "Clear to merge"
+    )
 
     lines.append("| | | |")
     lines.append("|:---:|---|---|")
@@ -556,6 +600,40 @@ def render(
             f"| 🖥️ | Policy resolution | {len(resolution.get('resolutions', []))} rules resolved"
             f" · {resolution['total_workloads']} workloads |"
         )
+
+    # Label check
+    if not label_check.get("skipped"):
+        if lc_missing:
+            lc_items = "; ".join(
+                f"`{m['label_key']}={m['label_value']}` in `{m['file']}`"
+                for m in label_check.get("missing", [])[:5]
+            )
+            lines.append(f"| ❌ | Label validation | {len(label_check['missing'])} missing — **blocks this PR** · {lc_items} |")
+        else:
+            lines.append(f"| ✅ | Label validation | All label references exist in PCE |")
+
+    # Mirror check
+    if not mirror_check.get("skipped", True) and mirror_check.get("checked", 0) > 0:
+        if mc_missing:
+            mc_items = "; ".join(
+                f"`{m['expected_mirror']}`"
+                for m in mirror_check.get("missing", [])[:3]
+            )
+            lines.append(f"| ❌ | Cross-scope mirrors | {mc_missing} missing — **blocks this PR** · {mc_items} |")
+        else:
+            lines.append(f"| ✅ | Cross-scope mirrors | All {mirror_check['checked']} cross-scope pair(s) have mirrors |")
+
+    # Blast radius
+    br_warnings = resolution.get("blast_radius_warnings", [])
+    if br_warnings:
+        br_blocks = [w for w in br_warnings if w["level"] == "block"]
+        br_warns  = [w for w in br_warnings if w["level"] == "warn"]
+        br_parts = []
+        if br_blocks:
+            br_parts.append(f"{len(br_blocks)} blocking (>{resolution.get('blast_radius_warnings', [{}])[0].get('blast_radius', '')} workloads)")
+        if br_warns:
+            br_parts.append(f"{len(br_warns)} warning")
+        lines.append(f"| {'❌' if br_blocks else '⚠️'} | Blast radius | {' · '.join(br_parts)} |")
 
     # FW change request files — show link when they exist in the PR branch
     if os.path.exists("fw-changes/fw-change-request.csv"):
@@ -596,6 +674,8 @@ def main():
     parser.add_argument("--changed-files", required=True)
     parser.add_argument("--diff-base", default=None,
                         help="Git ref to compare against for rule diff (e.g. origin/main)")
+    parser.add_argument("--label-check", default=None)
+    parser.add_argument("--mirror-check", default=None)
     parser.add_argument("--output", default="pr-comment.md")
     args = parser.parse_args()
 
@@ -606,6 +686,8 @@ def main():
         args.changed_files,
         args.output,
         args.diff_base,
+        label_check_path=args.label_check,
+        mirror_check_path=args.mirror_check,
     )
 
 

@@ -24,3 +24,10 @@ security:
 traffic:
   lookback_days: 30
   min_connections: 10
+
+blast_radius:
+  warn: 50       # warn when a single rule affects this many workloads
+  block: 500     # block PR when a single rule affects this many workloads
+
+stale_rules:
+  lookback_days: 90   # rules with zero traffic for this long are flagged

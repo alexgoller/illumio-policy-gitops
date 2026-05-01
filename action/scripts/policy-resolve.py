@@ -254,6 +254,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--changed-files", required=True)
     parser.add_argument("--output", default="policy-resolution.json")
+    parser.add_argument("--blast-radius-warn", type=int, default=50,
+                        help="Warn when a single rule affects this many workloads")
+    parser.add_argument("--blast-radius-block", type=int, default=500,
+                        help="Block PR when a single rule affects this many workloads")
     args = parser.parse_args()
 
     pce = get_pce()
@@ -276,6 +280,8 @@ def main():
     ]
 
     resolutions = []
+    blast_radius_warnings = []
+
     for filepath in files:
         if not os.path.exists(filepath):
             continue
@@ -290,22 +296,58 @@ def main():
             consumers = resolve_actors(rule["consumers"], consumer_scope, workloads)
             providers = resolve_actors(rule["providers"], sc, workloads)
 
-            resolutions.append({
+            # Blast radius: total unique workloads touched by this rule
+            all_affected = set(consumers["hostnames"]) | set(providers["hostnames"])
+            blast_radius = len(all_affected)
+
+            resolution_entry = {
                 "file": filepath,
                 "ruleset_name": rule["ruleset_name"],
                 "rule_name": rule["name"],
                 "services": _fmt_services(rule.get("services", [])),
                 "consumers": consumers,
                 "providers": providers,
-            })
+                "blast_radius": blast_radius,
+            }
+            resolutions.append(resolution_entry)
+
+            if blast_radius >= args.blast_radius_block:
+                blast_radius_warnings.append({
+                    "file": filepath,
+                    "rule_name": rule["name"],
+                    "blast_radius": blast_radius,
+                    "level": "block",
+                    "message": (
+                        f"Rule affects {blast_radius} workloads "
+                        f"(threshold: {args.blast_radius_block}) — this is an unusually large blast radius"
+                    ),
+                })
+                print(f"  BLAST RADIUS BLOCK: {rule['name']} affects {blast_radius} workloads")
+            elif blast_radius >= args.blast_radius_warn:
+                blast_radius_warnings.append({
+                    "file": filepath,
+                    "rule_name": rule["name"],
+                    "blast_radius": blast_radius,
+                    "level": "warn",
+                    "message": (
+                        f"Rule affects {blast_radius} workloads "
+                        f"(threshold: {args.blast_radius_warn}) — verify scope is intentional"
+                    ),
+                })
+                print(f"  BLAST RADIUS WARN: {rule['name']} affects {blast_radius} workloads")
 
     total_workloads = len(workloads)
+    has_blast_block = any(w["level"] == "block" for w in blast_radius_warnings)
     print(f"Policy resolution: {len(resolutions)} rules resolved using {total_workloads} workloads")
+    if blast_radius_warnings:
+        print(f"Blast radius warnings: {len(blast_radius_warnings)} ({sum(1 for w in blast_radius_warnings if w['level'] == 'block')} blocking)")
 
     with open(args.output, "w") as f:
         json.dump({
             "resolutions": resolutions,
             "total_workloads": total_workloads,
+            "blast_radius_warnings": blast_radius_warnings,
+            "has_blast_block": has_blast_block,
         }, f, indent=2)
 
 

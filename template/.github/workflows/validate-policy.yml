@@ -73,6 +73,30 @@ jobs:
             --output security-report.json
         continue-on-error: true
 
+      - name: Label validation
+        id: labelcheck
+        if: steps.changes.outputs.count != '0'
+        env:
+          PCE_HOST: ${{ secrets.PCE_HOST }}
+          PCE_PORT: ${{ secrets.PCE_PORT }}
+          PCE_ORG_ID: ${{ secrets.PCE_ORG_ID }}
+          PCE_API_KEY: ${{ secrets.PCE_API_KEY }}
+          PCE_API_SECRET: ${{ secrets.PCE_API_SECRET }}
+        run: |
+          python3 .github/scripts/label-check.py \
+            --changed-files "${{ steps.changes.outputs.files }}" \
+            --output label-check-report.json
+        continue-on-error: true
+
+      - name: Cross-scope mirror check
+        id: mirrorcheck
+        if: steps.changes.outputs.count != '0'
+        run: |
+          python3 .github/scripts/mirror-check.py \
+            --changed-files "${{ steps.changes.outputs.files }}" \
+            --output mirror-check-report.json
+        continue-on-error: true
+
       - name: Traffic evidence
         id: traffic
         if: steps.changes.outputs.count != '0'
@@ -101,6 +125,8 @@ jobs:
         run: |
           python3 .github/scripts/policy-resolve.py \
             --changed-files "${{ steps.changes.outputs.files }}" \
+            --blast-radius-warn 50 \
+            --blast-radius-block 500 \
             --output policy-resolution.json
         continue-on-error: true
 
@@ -134,6 +160,8 @@ jobs:
             --security security-report.json \
             --traffic traffic-report.json \
             --resolution policy-resolution.json \
+            --label-check label-check-report.json \
+            --mirror-check mirror-check-report.json \
             --changed-files "${{ steps.changes.outputs.files }}" \
             --diff-base origin/main \
             --output pr-comment.md
@@ -169,8 +197,36 @@ jobs:
               });
             }
 
-      - name: Fail on critical findings
-        if: steps.security.outcome == 'failure'
+      - name: Fail on blocking findings
+        if: steps.changes.outputs.count != '0'
         run: |
-          echo "Critical security findings detected — PR blocked"
-          exit 1
+          BLOCKED=0
+          if [ "${{ steps.security.outcome }}" = "failure" ]; then
+            echo "Critical security findings detected"
+            BLOCKED=1
+          fi
+          if [ -f label-check-report.json ]; then
+            MISSING=$(python3 -c "import json; d=json.load(open('label-check-report.json')); print(len(d.get('missing', [])))")
+            if [ "$MISSING" != "0" ]; then
+              echo "Missing label references detected: $MISSING"
+              BLOCKED=1
+            fi
+          fi
+          if [ -f mirror-check-report.json ]; then
+            MISSING=$(python3 -c "import json; d=json.load(open('mirror-check-report.json')); print(len(d.get('missing', [])))")
+            if [ "$MISSING" != "0" ]; then
+              echo "Missing cross-scope mirror files: $MISSING"
+              BLOCKED=1
+            fi
+          fi
+          if [ -f policy-resolution.json ]; then
+            BLAST=$(python3 -c "import json; d=json.load(open('policy-resolution.json')); print('1' if d.get('has_blast_block') else '0')")
+            if [ "$BLAST" = "1" ]; then
+              echo "Blast radius threshold exceeded"
+              BLOCKED=1
+            fi
+          fi
+          if [ "$BLOCKED" = "1" ]; then
+            echo "PR blocked — see Policy Change Report comment for details"
+            exit 1
+          fi
