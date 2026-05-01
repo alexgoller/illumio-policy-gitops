@@ -1,0 +1,65 @@
+name: coreservices
+description: "Core infrastructure services — unscoped, applies to all workloads"
+enabled: true
+scopes: []
+
+rules:
+  # Every workload needs DNS
+  - name: all-to-dns
+    description: "All workloads resolve DNS"
+    enabled: true
+    consumers:
+      - actors: ams
+    providers:
+      - label: {role: dns}
+    services:
+      - {port: 53, proto: udp}
+      - {port: 53, proto: tcp}
+
+  # Every workload syncs time
+  - name: all-to-ntp
+    description: "All workloads sync NTP"
+    enabled: true
+    consumers:
+      - actors: ams
+    providers:
+      - label: {role: ntp}
+    services:
+      - {port: 123, proto: udp}
+
+  # Every workload ships logs to syslog/SIEM
+  - name: all-to-syslog
+    description: "All workloads forward logs to syslog collectors"
+    enabled: true
+    consumers:
+      - actors: ams
+    providers:
+      - label: {role: syslog}
+    services:
+      - {port: 514, proto: udp}
+      - {port: 514, proto: tcp}
+      - {port: 6514, proto: tcp}   # syslog over TLS
+
+  # ICMP for network diagnostics (ping, traceroute)
+  - name: icmp-internal
+    description: "ICMP between managed workloads for diagnostics"
+    enabled: true
+    consumers:
+      - actors: ams
+    providers:
+      - actors: ams
+    services:
+      - name: icmp
+
+deny_rules:
+  # No workload should ever reach the internet directly on management ports
+  - name: deny-ssh-to-internet
+    description: "Managed workloads must not SSH to the internet directly — use jumphost"
+    type: deny
+    enabled: true
+    consumers:
+      - actors: ams
+    providers:
+      - ip_list: {name: "Any (0.0.0.0/0 and ::/0)"}
+    services:
+      - {port: 22, proto: tcp}
