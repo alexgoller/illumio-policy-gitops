@@ -96,12 +96,12 @@ illumio-policy/                         ← your policy repository
 │   │   ├── _scope.yaml                 ← label definitions + owner team
 │   │   ├── intra-rules.yaml            ← within-scope rules
 │   │   └── cross-scope/
-│   │       └── to-shareddb.yaml        ← rules reaching outside this scope
+│   │       └── to-shareddb.yaml        ← GENERATED view of outbound deps (read-only)
 │   └── app-shareddb_env-prod/
 │       ├── _scope.yaml
 │       ├── intra-rules.yaml
 │       └── inbound/
-│           └── from-payments.yaml      ← mirror of payments' cross-scope rule
+│           └── from-payments.yaml      ← canonical cross-scope rule (authored here)
 ├── ip-lists/
 │   ├── any.yaml
 │   ├── rfc1918.yaml
@@ -119,11 +119,11 @@ Policy is organized around **scopes** — pairs of labels (typically `app` + `en
 | Rule Type | Location | Who Must Approve |
 |---|---|---|
 | **Intra-scope** | `scopes/{scope}/intra-rules.yaml` | Scope owner team |
-| **Cross-scope** (requester side) | `scopes/{scope}/cross-scope/to-{target}.yaml` | Requester team + target team + security |
-| **Cross-scope** (target side) | `scopes/{scope}/inbound/from-{requester}.yaml` | Same as above |
+| **Cross-scope** (canonical) | `scopes/{provider}/inbound/from-{requester}.yaml` | Provider scope owner + security |
+| **Cross-scope** (requester view) | `scopes/{requester}/cross-scope/to-{provider}.yaml` | _Generated, read-only — not authored or reviewed_ |
 | **Global** (unscoped) | `scopes/_global/` | Security team only |
 
-This structure makes it impossible for Team A to add a rule into Team B's scope without Team B's explicit GitHub review and approval.
+This structure makes it impossible for Team A to add a rule into Team B's scope without Team B's explicit GitHub review and approval. See [Cross-Scope Dependencies (Provider-Centric)](#cross-scope-dependencies-provider-centric) for why the canonical rule lives in the provider's scope.
 
 ### The Pull Request Workflow
 
@@ -132,15 +132,15 @@ This structure makes it impossible for Team A to add a rule into Team B's scope 
 2. Opens pull request
 3. GitHub Actions pipeline runs automatically:
    ├── YAML syntax validation
-   ├── Security policy checks (8 configurable rules)
+   ├── Security policy checks (9 enforced rules)
    ├── Traffic evidence query (PCE Explorer API)
    ├── Policy resolution (which workloads are affected)
    ├── Firewall change request generation
    └── PR comment posted with full findings
 4. CODEOWNERS enforces required reviewers:
-   ├── Scope owner (payments-team)
-   ├── Target scope owner (database-team, for cross-scope)
-   └── Security team (for cross-scope and global)
+   ├── Scope owner (the provider team — owns the workloads being protected)
+   ├── Security team (for cross-scope and global)
+   └── (requester is the PR author; their consent is implicit in opening the PR)
 5. All checks pass + all reviewers approve → merge unblocked
 6. Merge to main → provision-policy.yml runs → PCE draft updated
 7. Full audit trail: Git diff + PR + reviews + merge timestamp
@@ -158,7 +158,7 @@ Every changed `.yaml` file is parsed. Deleted files are skipped gracefully. Inva
 
 ### Stage 2 — Security Checks
 
-Eight configurable rules evaluated against the policy diff:
+Nine enforced rules evaluated against the policy diff:
 
 | Rule | Severity | What It Catches |
 |---|---|---|
@@ -170,6 +170,9 @@ Eight configurable rules evaluated against the policy diff:
 | **SEC-006** | ⚠️ High | Database ports (5432, 3306, 1433, 1521, 27017) exposed to non-role consumers |
 | **SEC-007** | ⚠️ Medium | IP lists with /8 or broader CIDR (e.g. 10.0.0.0/8 = 16 million IPs) |
 | **SEC-008** | ⚠️ High | All Workloads or Any IP as consumer without a role-specific provider |
+| **SEC-010** | ⚠️ Medium | Extra-scope rule authored in the wrong scope (see [provider-centric cross-scope](#cross-scope-dependencies-provider-centric)) |
+
+<sub>SEC-009 is reserved in `.illumio/security-rules.yaml` for an HTTP-without-HTTPS check that is not yet enforced.</sub>
 
 Rules are **fully configurable** in `.illumio/security-rules.yaml`. Each rule supports exemptions — for example, exempting a core-services scope from SEC-005 when SMB is legitimately required for Active Directory.
 
@@ -289,16 +292,48 @@ scopes/app-ordering_env-prod/    @org/ordering-team
 
 **Cross-scope rule example:** Payments engineer adds a rule from payments to shareddb.
 
-1. PR touches `cross-scope/to-shareddb.yaml` and `inbound/from-payments.yaml`
+1. PR adds the **single canonical file** `scopes/app-shareddb_env-prod/inbound/from-payments.yaml`
 2. CODEOWNERS matches trigger required reviews from:
-   - `@org/payments-team` (requester — author auto-approves)
-   - `@org/database-team` (target — must explicitly approve)
+   - `@org/database-team` (provider — owns the shareddb workloads being reached, must approve)
    - `@org/security-team` (cross-scope pattern — must explicitly approve)
+   - the payments engineer is the **PR author** — their consent is implicit
 3. PR comment shows 891 blocked flows justifying the rule
 4. Database team reviews the evidence, approves
 5. Security team validates least-privilege, approves
 6. GitHub unblocks merge → plugin provisions to PCE
-7. Git records: author, reviewers, merge timestamp, exact diff
+7. On merge, the requester-side `scopes/app-payments_env-prod/cross-scope/to-shareddb.yaml` is regenerated for discoverability
+8. Git records: author, reviewers, merge timestamp, exact diff
+
+### Cross-Scope Dependencies (Provider-Centric)
+
+Illumio scopes are **provider-centric**: a ruleset's scope defines whose workloads are
+being *protected* — the providers. An extra-scope (cross-scope) rule says "consumers
+from outside this scope may reach providers inside it," so the rule belongs to the
+**provider's** scope, and the provider team owns who is allowed in.
+
+Because of this, a cross-scope dependency is authored **once**, as a single file in the
+provider's scope:
+
+```
+scopes/app-shareddb_env-prod/inbound/from-payments.yaml   ← authored, canonical, provisioned
+```
+
+The requester team (payments) is the PR author; their consent is implicit in opening the
+PR. The provider team (database) + security are the required approvers via CODEOWNERS on
+`inbound/`. There is no second file to author and no redundant mirror to keep in sync.
+
+For discoverability from the requester's side, the pipeline **generates** a read-only view
+on merge:
+
+```
+scopes/app-payments_env-prod/cross-scope/to-shareddb.yaml   ← GENERATED (generated: true)
+```
+
+Generated files carry `generated: true`; they are never provisioned to the PCE and are
+skipped by the security checks. **SEC-010** enforces this model: it flags an extra-scope
+rule authored in the wrong scope (e.g. filed under the consumer's scope, or with providers
+naming a different app than the enclosing scope), and flags the deprecated hand-authored
+`requester:`/`target:` courtesy schema.
 
 ---
 
@@ -362,27 +397,35 @@ deny_rules:
 
 ### Cross-Scope Rule
 
+Authored **once** in the provider's scope (provider-centric). The scope is the provider
+(`shareddb`); the external consumer (`payments`) is allowed in via `unscoped_consumers`.
+The requester-side `cross-scope/to-shareddb.yaml` is generated from this file — do not
+author it by hand.
+
 ```yaml
-# scopes/app-payments_env-prod/cross-scope/to-shareddb.yaml
-name: payments-to-shareddb
+# scopes/app-shareddb_env-prod/inbound/from-payments.yaml
+name: shareddb-prod-inbound-from-payments
 type: extra-scope
-
-requester:
-  scope: payments-prod
-  consumers:
-    - label: {role: processing}
-
-target:
-  scope: shareddb-prod
-  providers:
-    - label: {role: db}
-
-services:
-  - {port: 5432, proto: tcp}
+enabled: true
 
 justification: "Payment processing requires direct DB write access for transaction commits"
 requested_by: alice@example.com
 requested_date: "2026-04-26"
+
+scopes:
+  - - label: {app: shareddb}
+    - label: {env: prod}
+
+rules:
+  - name: payments-to-db
+    unscoped_consumers: true          # consumers are outside this (shareddb) scope
+    consumers:
+      - label: {app: payments}        # the external requester
+      - label: {role: processing}
+    providers:
+      - label: {role: db}             # in-scope provider workloads
+    services:
+      - {port: 5432, proto: tcp}
 ```
 
 ### Actor Formats

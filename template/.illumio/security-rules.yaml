@@ -85,6 +85,18 @@ rules:
     ports: [80]
     description: "Consider requiring HTTPS (443) instead of HTTP (80)"
 
+  - id: SEC-010
+    name: "Extra-scope rule provider-centric placement"
+    severity: medium
+    action: warn
+    description: >
+      Scopes are provider-centric: a cross-scope (extra-scope) rule protects the
+      provider's workloads, so it must be authored in the provider's scope
+      (scopes/app-<provider>_env-<env>/inbound/from-<requester>.yaml). Flags rules
+      whose consumer app equals the enclosing scope, or whose providers name a
+      different app than the scope. Also flags the deprecated requester/target
+      courtesy schema (the requester-side file is generated, not authored).
+
 # Exemptions: bypass specific rules for matching rulesets or scopes
 exemptions:
   - ruleset_pattern: "coreservices"

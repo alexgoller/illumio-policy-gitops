@@ -1,6 +1,6 @@
 apiVersion: plugger/v1
 name: policy-gitops
-version: 0.2.0
+version: 0.3.0
 image: policy-gitops:latest
 
 schedule:

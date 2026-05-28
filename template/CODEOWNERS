@@ -9,11 +9,17 @@ services/               @org/security-team
 .illumio/               @org/security-team
 
 # Per-scope ownership — each team owns their application scope
-# scopes/payments-prod/   @org/payments-team
-# scopes/shareddb-prod/   @org/database-team
-# scopes/ordering-prod/   @org/ordering-team
-# scopes/frontend-prod/   @org/frontend-team
+# scopes/app-payments_env-prod/   @org/payments-team
+# scopes/app-shareddb_env-prod/   @org/database-team
+# scopes/app-ordering_env-prod/   @org/ordering-team
+# scopes/app-frontend_env-prod/   @org/frontend-team
 
-# Cross-scope rules always require security team review
-scopes/*/cross-scope/   @org/security-team
+# Cross-scope rules are provider-centric: the canonical rule is authored in the
+# PROVIDER's scope under inbound/. The provider scope owner (matched by the
+# per-scope line above) plus security must approve it; the requester is the PR
+# author. Security reviews all cross-scope changes.
 scopes/*/inbound/       @org/security-team
+
+# cross-scope/ holds GENERATED, read-only requester-side views (generated: true).
+# They are regenerated on merge and not authored by hand — security owns them.
+scopes/*/cross-scope/   @org/security-team

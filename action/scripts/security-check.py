@@ -83,6 +83,21 @@ DEFAULT_RULES = [
             "Restrict consumers to a specific role or label."
         ),
     },
+    # SEC-009 (HTTP-without-HTTPS) is defined in .illumio/security-rules.yaml as a
+    # config-only stub with no implementation here — do not reuse this id.
+    {
+        "id": "SEC-010",
+        "name": "Extra-scope rule provider-centric placement",
+        "severity": "medium",
+        "action": "warn",
+        "description": (
+            "Scopes are provider-centric: an extra-scope (cross-scope) rule protects the "
+            "provider's workloads, so it must be authored in the provider's scope. The rule's "
+            "providers belong to the enclosing scope; consumers are external. A rule whose "
+            "consumer app matches the enclosing scope, or whose providers name a different app "
+            "than the scope, is filed in the wrong directory."
+        ),
+    },
 ]
 
 
@@ -218,6 +233,66 @@ def check_broad_consumer(rule_data: dict) -> bool:
     return True
 
 
+def _scope_app_env(data: dict):
+    """Return (app, env) from the ruleset's scope labels, or (None, None) if global."""
+    app = env = None
+    for scope_entry in data.get("scopes", []):
+        for item in scope_entry:
+            if isinstance(item, dict) and isinstance(item.get("label"), dict):
+                lbl = item["label"]
+                if "app" in lbl:
+                    app = lbl["app"]
+                if "env" in lbl:
+                    env = lbl["env"]
+    return app, env
+
+
+def _label_apps(actors) -> set:
+    """Collect the set of 'app' label values among a list of consumer/provider actors."""
+    apps = set()
+    for a in actors:
+        if isinstance(a, dict) and isinstance(a.get("label"), dict) and "app" in a["label"]:
+            apps.add(a["label"]["app"])
+    return apps
+
+
+def check_extra_scope_placement(data: dict):
+    """SEC-010: extra-scope rules must live in the provider's scope.
+
+    Returns a list of (rule_name, reason) tuples. An extra-scope rule is correctly
+    placed when its providers belong to the enclosing scope and its consumers are
+    external. Flags, per rule:
+      - consumer app == the enclosing scope app (rule filed in the consumer's scope
+        instead of the provider's), or
+      - providers explicitly name a different app than the enclosing scope.
+    Provider labels with no 'app' (e.g. just a role) are implicitly in-scope and OK.
+    """
+    problems = []
+    scope_app, _scope_env = _scope_app_env(data)
+    if not scope_app:
+        return problems  # global / unscoped ruleset — placement check does not apply
+    for rule in data.get("rules", []):
+        if not isinstance(rule, dict) or not rule.get("unscoped_consumers"):
+            continue
+        name = rule.get("name", "(unnamed)")
+        consumer_apps = _label_apps(rule.get("consumers", []))
+        provider_apps = _label_apps(rule.get("providers", []))
+        if scope_app in consumer_apps:
+            problems.append((
+                name,
+                f"consumer app '{scope_app}' equals the enclosing scope — author this rule "
+                "in the provider's scope, not the consumer's",
+            ))
+        elif provider_apps and scope_app not in provider_apps:
+            other = sorted(provider_apps)[0]
+            problems.append((
+                name,
+                f"providers are app '{other}' but the scope is app '{scope_app}' — extra-scope "
+                f"rules belong in the provider's scope (app '{other}')",
+            ))
+    return problems
+
+
 def _is_rule_applicable(rule_cfg: dict, is_scoped: bool) -> bool:
     """Check scope_filter to decide if a rule applies to this ruleset."""
     scope_filter = rule_cfg.get("scope_filter", "")
@@ -265,6 +340,11 @@ def analyze_file(filepath, rules, exemptions):
         return findings
 
     if not isinstance(data, dict):
+        return findings
+
+    # Generated courtesy/doc files are derived from canonical policy, never authored
+    # or provisioned — they are not subject to security checks.
+    if data.get("generated"):
         return findings
 
     is_scoped = _ruleset_is_scoped(data)
@@ -419,6 +499,36 @@ def analyze_file(filepath, rules, exemptions):
                             f"Rule '{rule_name}' has a broad consumer (All Workloads or catch-all IP list) "
                             "with no role constraint on providers"
                         ),
+                    })
+
+    # SEC-010: extra-scope rules must be authored in the provider's scope
+    if ("SEC-010" not in exempt_rules and "SEC-010" in rule_cfg_by_id
+            and "scopes" in filepath):
+        cfg = rule_cfg_by_id["SEC-010"]
+        if not _is_scope_exempt(data, exemptions, "SEC-010"):
+            # Hand-authored requester/target courtesy schema is deprecated — the rule
+            # should live once in the provider's inbound/ file (the requester-side file
+            # is generated). Detect it by the requester/target shape with no rules.
+            if data.get("type") == "extra-scope" and "target" in data and "rules" not in data:
+                findings.append({
+                    "file": filepath,
+                    "rule_id": "SEC-010",
+                    "severity": cfg.get("severity", "medium"),
+                    "action": cfg.get("action", "warn"),
+                    "message": (
+                        "Deprecated cross-scope authoring format (requester/target). Author the "
+                        "rule once in the target scope's inbound/ file; the requester-side file "
+                        "is generated by generate-cross-scope-docs.py."
+                    ),
+                })
+            else:
+                for rule_name, reason in check_extra_scope_placement(data):
+                    findings.append({
+                        "file": filepath,
+                        "rule_id": "SEC-010",
+                        "severity": cfg.get("severity", "medium"),
+                        "action": cfg.get("action", "warn"),
+                        "message": f"Extra-scope rule '{rule_name}' misplaced: {reason}",
                     })
 
     return findings
