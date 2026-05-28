@@ -259,6 +259,16 @@ rules:
       IP lists with /8 or broader CIDRs
     message: "Very broad CIDR range. Consider narrowing."
 
+  - id: SEC-010
+    name: "Extra-scope rule provider-centric placement"
+    severity: medium
+    action: warn
+    check: |
+      Extra-scope rules must be authored in the provider's scope. Flags a rule
+      whose consumer app equals the enclosing scope, or whose providers name a
+      different app than the scope, plus the deprecated requester/target schema.
+    message: "Author cross-scope rules in the provider's inbound/ file."
+
 # Override: rules that are always allowed (bypass security checks)
 exemptions:
   - ruleset_pattern: "coreservices"
@@ -642,28 +652,35 @@ rules:
     enabled: true
 ```
 
-### Cross-scope rule request
+### Cross-scope rule (provider-centric, authored once)
+Scopes are provider-centric, so the cross-scope rule is authored as a single file in
+the **provider's** scope. The requester-side `cross-scope/to-shareddb.yaml` is generated
+from this file and is never authored by hand.
 ```yaml
-name: payments-to-shareddb
+# scopes/app-shareddb_env-prod/inbound/from-payments.yaml
+name: shareddb-prod-inbound-from-payments
 description: "Payments app needs access to shared database"
 type: extra-scope
-
-requester:
-  scope: payments-prod
-  consumers:
-    - label: {role: processing}
-
-target:
-  scope: shareddb-prod
-  providers:
-    - label: {role: db}
-
-services:
-  - {port: 5432, proto: tcp}
+enabled: true
 
 justification: "Payment processing requires direct DB access for transaction writes"
 requested_by: alice@example.com
 requested_date: "2026-04-26"
+
+scopes:
+  - - label: {app: shareddb}
+    - label: {env: prod}
+
+rules:
+  - name: payments-to-db
+    unscoped_consumers: true
+    consumers:
+      - label: {app: payments}
+      - label: {role: processing}
+    providers:
+      - label: {role: db}
+    services:
+      - {port: 5432, proto: tcp}
 ```
 
 ### CODEOWNERS
@@ -674,13 +691,15 @@ ip-lists/               @org/security-team
 services/               @org/security-team
 
 # Per-scope ownership
-scopes/payments-prod/   @org/payments-team
-scopes/shareddb-prod/   @org/database-team
-scopes/ordering-prod/   @org/ordering-team
+scopes/app-payments_env-prod/   @org/payments-team
+scopes/app-shareddb_env-prod/   @org/database-team
+scopes/app-ordering_env-prod/   @org/ordering-team
 
-# Cross-scope rules require BOTH teams
-scopes/*/cross-scope/   @org/security-team
+# Cross-scope: the canonical rule lives in the provider's inbound/ — the provider
+# scope owner (per-scope line above) plus security approve. The requester is the
+# PR author. cross-scope/ holds generated, read-only requester-side views.
 scopes/*/inbound/       @org/security-team
+scopes/*/cross-scope/   @org/security-team
 ```
 
 ---
@@ -689,17 +708,17 @@ scopes/*/inbound/       @org/security-team
 
 ```
 1. Team A (payments) creates a PR:
-   - Adds: scopes/payments-prod/cross-scope/to-shareddb.yaml
-   - Adds: scopes/shareddb-prod/inbound/from-payments.yaml (mirror)
+   - Adds the single canonical file in the PROVIDER's scope:
+     scopes/app-shareddb_env-prod/inbound/from-payments.yaml
 
 2. GitHub Actions validate-policy runs:
-   - Security check: flags as HIGH (cross-scope, DB access)
+   - Security check: flags as HIGH (cross-scope, DB access); SEC-010 verifies placement
    - Traffic evidence: queries PCE, finds 891 blocked flows → JUSTIFIED
    - Posts beautiful PR comment with all details
 
 3. CODEOWNERS triggers reviews:
-   - @org/payments-team → auto-approved (their own scope)
-   - @org/database-team → MUST review (touches their inbound dir)
+   - payments engineer is the PR author (consent implicit — requester centric)
+   - @org/database-team → MUST review (the provider — owns shareddb's inbound)
    - @org/security-team → MUST review (cross-scope policy)
 
 4. Team B (database) reviews:
@@ -715,6 +734,7 @@ scopes/*/inbound/       @org/security-team
 6. PR merges → provision-policy runs:
    - Creates the extra-scope ruleset on PCE draft
    - Provisions to active
+   - Regenerates the requester-side cross-scope/to-shareddb.yaml view
    - Comments with result
 
 7. Full audit trail in Git:

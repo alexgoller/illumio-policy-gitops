@@ -158,6 +158,18 @@ jobs:
 
             console.log(`Posted provision status on PR #${pr.number}`);
 
+      - name: Regenerate cross-scope docs
+        if: steps.changes.outputs.count != '0'
+        run: |
+          # Provider-centric model: regenerate the read-only requester-side
+          # cross-scope/to-<provider>.yaml views from the canonical inbound files.
+          python3 .github/scripts/generate-cross-scope-docs.py
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add scopes/
+          git diff --staged --quiet || \
+            (git commit -m "chore: regenerate cross-scope docs [skip ci]" && git push)
+
       - name: Update README badges
         if: steps.changes.outputs.count != '0'
         run: |
@@ -168,8 +180,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md
           git diff --staged --quiet || \
-            git commit -m "chore: update policy badges [skip ci]" && \
-            git push
+            (git commit -m "chore: update policy badges [skip ci]" && git push)
 
       - name: Fail if provision errored
         if: steps.provision.outcome == 'failure'

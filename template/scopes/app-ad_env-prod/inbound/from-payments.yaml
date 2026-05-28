@@ -3,6 +3,18 @@ description: "Inbound from payments scope — AD authentication for payment proc
 type: extra-scope
 enabled: true
 
+# Provider-centric model: this file (in the AD scope) is the single source of
+# truth for the payments→AD dependency. The AD team + security own and approve it;
+# payments is the PR author. The requester-side scopes/app-payments_env-prod/
+# cross-scope/to-ad.yaml is GENERATED from this file for discoverability.
+justification: >
+  Payment processing workloads use Kerberos authentication for service accounts
+  and LDAP to validate group membership for PCI-DSS role enforcement.
+  LDAPS (636) is required; plaintext LDAP (389) is used only for initial
+  configuration discovery and will be removed after migration is complete.
+requested_by: alice@example.com
+requested_date: "2026-04-15"
+
 scopes:
   - - label: {app: ad}
     - label: {env: prod}

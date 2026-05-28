@@ -125,6 +125,48 @@ def provision_ip_list(pce, filepath, data, label_map, ipl_map=None):
         return "created", name
 
 
+def provision_service(pce, filepath, data):
+    """Create or update a named service on the PCE draft (Git -> PCE).
+
+    Net-new services authored in Git must be created so that rules referencing
+    them by name resolve. Matches an existing draft service by name.
+    """
+    name = data["name"]
+    proto_map = {"tcp": 6, "udp": 17, "icmp": 1}
+    service_ports = []
+    for sp in data.get("service_ports", []):
+        if not isinstance(sp, dict):
+            continue
+        entry = {}
+        if "port" in sp:
+            entry["port"] = sp["port"]
+        if "to_port" in sp:
+            entry["to_port"] = sp["to_port"]
+        proto = sp.get("proto", "tcp")
+        entry["proto"] = proto_map.get(proto, proto) if isinstance(proto, str) else proto
+        service_ports.append(entry)
+
+    body = {
+        "name": name,
+        "description": data.get("description") or "",
+        "service_ports": service_ports,
+    }
+    existing = pce.get("/sec_policy/draft/services").json()
+    found = next((s for s in existing if s["name"] == name), None)
+    if found:
+        pce.put(found["href"], json=body)
+        return "updated", name
+    else:
+        pce.post("/sec_policy/draft/services", json=body)
+        return "created", name
+
+
+def _refresh_service_cache(pce, svc_map):
+    """Merge current draft services into svc_map so rules resolve newly-created services."""
+    for s in pce.get("/sec_policy/draft/services").json():
+        svc_map[s["name"]] = s["href"]
+
+
 def provision_ruleset(pce, filepath, data, label_map, svc_map, ipl_map=None):
     name = data["name"]
 
@@ -181,6 +223,14 @@ def delete_object(pce, filepath):
                 pce.delete(ipl["href"])
                 return "deleted", ipl["name"]
 
+    elif filepath.startswith("services/"):
+        existing = pce.get("/sec_policy/draft/services").json()
+        for s in existing:
+            sanitized = s["name"].lower().replace(" ", "-").replace("/", "-")
+            if sanitized == basename or s["name"] == basename:
+                pce.delete(s["href"])
+                return "deleted", s["name"]
+
     elif filepath.startswith("scopes/"):
         existing = pce.get("/sec_policy/draft/rule_sets", params={"max_results": 5000}).json()
         for rs in existing:
@@ -222,6 +272,18 @@ def main():
     label_map, svc_map, ipl_map = build_caches(pce)
 
     files = [f.strip() for f in changed_raw.split("\n") if f.strip()]
+
+    # Provision dependencies before dependents: ip-lists and services must exist
+    # before the rulesets that reference them by name can resolve.
+    def _order(fp):
+        if fp.startswith("ip-lists/"):
+            return 0
+        if fp.startswith("services/"):
+            return 1
+        if fp.startswith("scopes/"):
+            return 2
+        return 3
+    files.sort(key=_order)
     print(f"Processing {len(files)} changed files...")
 
     created = 0
@@ -229,6 +291,8 @@ def main():
     deleted = 0
     errors = []
     processed_files = []
+    services_dirty = False  # a service was created/updated this run
+    cache_refreshed = False  # svc_map refreshed before scopes are processed
 
     for filepath in files:
         if "_scope.yaml" in filepath or ".gitkeep" in filepath:
@@ -259,12 +323,24 @@ def main():
         if not isinstance(data, dict) or "name" not in data:
             continue
 
+        # Generated courtesy/doc files are derived from canonical policy — skip them.
+        if data.get("generated"):
+            continue
+
         try:
             if filepath.startswith("ip-lists/"):
                 action, name = provision_ip_list(pce, filepath, data, label_map, ipl_map)
+            elif filepath.startswith("services/"):
+                action, name = provision_service(pce, filepath, data)
+                if action in ("created", "updated"):
+                    services_dirty = True
             elif filepath.startswith("scopes/"):
                 if "rules" not in data:
                     continue
+                # Pick up services created earlier this run before resolving the ruleset.
+                if services_dirty and not cache_refreshed:
+                    _refresh_service_cache(pce, svc_map)
+                    cache_refreshed = True
                 action, name = provision_ruleset(pce, filepath, data, label_map, svc_map, ipl_map)
             else:
                 continue
